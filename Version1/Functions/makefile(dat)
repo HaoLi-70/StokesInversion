@@ -1,0 +1,68 @@
+# Makefile MCMC inversion
+#-------------------------------------------
+CC = gcc
+ARRCS = ar rcs
+CFLAGS = -c
+
+
+all: MCMC_INVERSION libmine.a clean
+
+OBJ1=ALLOCATION.o\
+	ANGULAR_MOMENTUM.o\
+	FADDEEVA.o\
+        INIT.o\
+        INVERSION.o\
+        LIKELIHOOD.o\
+        MCMC.o\
+        ME_PROFILE.o\
+        RANDOM_NUMBER.o\
+
+	
+       
+OBJ2=MCMC_INVERSION_DAT.o	
+
+ALLOCATION.o:ALLOCATION.c
+	$(CC) $(CFLAGS) ALLOCATION.c
+
+ANGULAR_MOMENTUM.o:ANGULAR_MOMENTUM.c
+	$(CC) $(CFLAGS) ANGULAR_MOMENTUM.c
+
+FADDEEVA.o:FADDEEVA.c
+	$(CC) $(CFLAGS) FADDEEVA.c
+
+INIT.o:INIT.c
+	$(CC) $(CFLAGS) INIT.c
+
+INVERSION.o:INVERSION.c
+	$(CC) $(CFLAGS) INVERSION.c
+
+LIKELIHOOD.o:LIKELIHOOD.c
+	$(CC) $(CFLAGS) LIKELIHOOD.c
+
+MCMC.o:MCMC.c
+	$(CC) $(CFLAGS) MCMC.c
+
+ME_PROFILE.o:ME_PROFILE.c
+	$(CC) $(CFLAGS) ME_PROFILE.c
+
+RANDOM_NUMBER.o:RANDOM_NUMBER.c
+	$(CC) $(CFLAGS) RANDOM_NUMBER.c
+
+libmine.a:$(OBJ1)
+	$(ARRCS) libmine.a $(OBJ1)
+
+MCMC_INVERSION_DAT.o:MCMC_INVERSION_DAT.c
+	$(CC) $(CFLAGS) MCMC_INVERSION_DAT.c
+
+MCMC_INVERSION: $(OBJ2) libmine.a
+	$(CC) $(OBJ2) -o MCMC_INVERSION -L. -lm -lmine
+
+#MCMC_INVERSION: $(OBJ1) $(OBJ2)
+#	$(CC) -o MCMC_INVERSION $(OBJ1) $(OBJ@)
+
+.PHONY.:clean
+
+clean:
+	rm -f *.o *.a
+
+
