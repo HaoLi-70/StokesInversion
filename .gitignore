@@ -1,0 +1,4 @@
+*.o
+*DS_Store
+*.a
+*MCMC_INV

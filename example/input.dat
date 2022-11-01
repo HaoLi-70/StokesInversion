@@ -1,0 +1,33 @@
+
+#Input file for MCMC inversion.
+
+verbose = YES
+
+path2profile = ../profiles/Profile_6302.dat
+#path2profile = ../profiles/Profile1546.dat
+
+
+#6302.4932
+lambda = 6302.4932
+
+geffect = 2.5
+
+gemc_simulation = YES
+
+gemc_nchains = 200
+
+dream_nchains = 40
+
+dream_ngener = 6000
+
+max_pair = 3
+
+ncr = 3
+
+cr_update = YES
+
+distribution_update = NO
+
+1sigma = YES
+
+output_samples = YES
