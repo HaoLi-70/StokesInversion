@@ -120,7 +120,7 @@ static int Hui_p6(double Nu, double y, double *H, double *L){
       Purpose:
         Voigt function.
       Record of revisions:
-        28 Nov 2018
+        07 May 2023
       Input parameters:
         Nu, reduced wavelength or frequency shift.
         y, damping parameter.
@@ -130,7 +130,7 @@ static int Hui_p6(double Nu, double y, double *H, double *L){
       Reference:
         Hui 1978 Journal of Quantitative Spectroscopy and Radiative Transfer
      ######################################################################*/
-    
+
     double A[7] = {122.607931777104326, 214.382388694706425, \
         181.928533092181549, 93.155580458138441, 30.180142196210589, \
         5.912626209773153, 0.564189583562615};
@@ -139,7 +139,7 @@ static int Hui_p6(double Nu, double y, double *H, double *L){
         53.992906912940207, 10.479857114260399};
     
     double complex Z = y-Nu*I;
-    double complex sum1=A[6], sum2=B[6];
+    double complex sum1=A[6], sum2=B[6]+Z;
     double complex tmp;
     int i;
 
