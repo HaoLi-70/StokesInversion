@@ -1,0 +1,68 @@
+
+
+verboselv = 1
+
+# Spectral line: central wavelength and effective Lande factor.
+# Repeat this key for additional or blended lines.
+lines = 6302.4932, 2.5
+# lines = 6301.5012, 1.667
+
+# DAT mode reads the wavelength from data_path, so wavelength_path is unused.
+profile_format = DAT
+data_path = ../../profiles/Profile13158_b2849.dat
+
+noise_mode = PIXEL
+#noise_level = 1e-3, 1e-3, 1e-3, 1e-3
+
+# DREAM controls
+num_chains = 20
+burnin_generations = 7000
+sampling_generations = 3500
+proposal_noise_update = Yes
+
+
+# NONE: no samples; MAGNETIC: magnetic parameters; ALL: all free parameters
+sample_output = MAGNETIC
+
+
+island_size = 4
+
+
+# Magnetic parameterization: CARTESIAN or SPHERICAL
+#magnetic_mode = CARTESIAN
+magnetic_mode = SPHERICAL
+
+
+# Cartesian magnetic-field bounds [G]
+Bounds_Bz = -3500, 3500
+Bounds_Bx = -3500, 3500
+Bounds_By = 0, 3500
+
+# Used only when magnetic_mode = SPHERICAL
+Bounds_Bmod = 0, 4500
+Bounds_ThetaB = 0, 1
+Bounds_PhiB = 0, 1
+
+# Other parameter bounds
+Bounds_Vlos = -20, 20
+Bounds_Dopp = 10, 80
+Bounds_Damp = 0.4, 0.8
+Bounds_Eta = 2, 90
+# Continuum bounds are derived independently from each observed profile.
+Bounds_Beta = 0.1, 0.85
+
+
+# Parameter inversion controls:
+#   YES       -> invert this parameter
+#   NO,value  -> keep it fixed at value
+#   value     -> shorthand for a fixed value
+
+Invert_Damp = YES
+
+
+# The DAT input contains exactly one profile, so sol_box is fixed internally
+# to a single pixel. Keeping the automatic value is recommended.
+sol_box = -1, -1, -1, -1
+
+
+

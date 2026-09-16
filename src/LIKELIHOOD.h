@@ -1,20 +1,13 @@
 
-#ifndef LIKELIHOOD_h
-#define LIKELIHOOD_h
+#pragma once
 
 /*--------------------------------------------------------------------------------*/
 
-#include <stdio.h>
-#include <stdbool.h>
-#include "ALLOCATION.h"
-#include "FORWARD_ME.h"
-#include "READ_INPUT_MCMC.h"
+#include "me_solver.h"
 
 /*--------------------------------------------------------------------------------*/
 
-double Likelihood_Log(STRUCT_ATOM *Atom, double *Par, \
-    STRUCT_OBSERVATION *Observation);
+double Likelihood_Log(double *model_values, STRUCT_STK *stokes, 
+    STRUCT_PARA *params, int *numerical_error);
 
 /*--------------------------------------------------------------------------------*/
-
-#endif /* LIKELIHOOD_h */

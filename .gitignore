@@ -1,4 +1,28 @@
+# OS and editor metadata
+.DS_Store
+/.vscode/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# C build products
 *.o
-*DS_Store
+*.d
 *.a
-*MCMC_INV
+*.so
+*.dylib
+*.dSYM/
+*.plist
+/MCMCINV
+/Makefile
+/objs/
+
+# Local runtime directory
+/test/
+
+# Files generated when running from example/
+/example/Samples.bin
+/example/inversion_result.fits
+/example/inversion.cache
+/example/log_*

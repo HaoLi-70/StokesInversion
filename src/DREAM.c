@@ -1,512 +1,982 @@
 
-#include "DREAM.h"
+#include "dream.h"
+#include "chain_statistics.h"
+#include "likelihood.h"
+#include "logger.h"
+#include "profile_io.h"
+#include "random.h"
+#include "sample_analysis.h"
+#include "sorting.h"
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /*--------------------------------------------------------------------------------*/
 
-extern int DREAM(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, STRUCT_DREAM *Dream, \
-    STRUCT_ATOM *Atom, STRUCT_OBSERVATION *Observation, STRUCT_PAR *Str_Par){
+#define DREAM_VERBOSE(mpi, level, fmt, ...)                                   \
+    do{                                                                       \
+      if((mpi)->island_rank == 0 && (mpi)->verbose_level >= (level)){         \
+        snprintf(message_buffer, sizeof(message_buffer), fmt, ##__VA_ARGS__); \
+        LOG_WRITE(message_buffer, true, true);                                \
+      }                                                                       \
+    }while(0)
+
+#define rhat_limit 1.2
+
+/*--------------------------------------------------------------------------------*/
+
+static int Chain_Init_Dream(STRUCT_MPI *mpi, STRUCT_DREAM *dream,
+    STRUCT_PARA *params, STRUCT_STK *stokes);
+static int Dream_Sample(STRUCT_MPI *mpi, STRUCT_DREAM *dream,
+    STRUCT_PARA *params, int npairs, double **chains, int chain_idx,
+    int generation_idx, double *sample);
+static int Sample_PairNum(int max_pairs, STRUCT_MPI *mpi);
+static int Init_Cr(STRUCT_DREAM *dream);
+static int Cr_Prob(STRUCT_DREAM *dream, STRUCT_MPI *mpi);
+static int Cr_distance(STRUCT_DREAM *dream, int nchains, int chain_idx,
+    int generation_idx, int cr_idx);
+static int Sample_Cr(STRUCT_DREAM *dream, STRUCT_MPI *mpi);
+static int Dream_Dim(STRUCT_MPI *mpi, STRUCT_DREAM *dream, int cr_idx);
+static int Dream_Diff(STRUCT_MPI *mpi, double **chains, int chain_idx,
+    int npairs, int njump, int *jump_dims, double *diff);
+static int Rm_Outlierchain(STRUCT_MPI *mpi, STRUCT_DREAM *dream,
+    int generation);
+static int Bounds_Enforce(double *sample, STRUCT_PARA *params);
+
+/*--------------------------------------------------------------------------------*/
+
+static int DREAM_Allgather(double **chains, double *likelihood, STRUCT_MPI *mpi, 
+    int nparams){
 
     /*######################################################################
       Purpose:
-        DREAM simulation.
-      Record of revisions:
-        10 Oct. 2022.
+        Gather the current chain states and log-likelihoods within an island.
       Input parameters:
-        Input, a structure saved the input information.
-        Mpi, a structure saved the Mpi information.
-        Dream, a structure saved the DREAM samples and likelihood.
-        Atom, a structure the atomic information
-        Observation, a structure saved observed profile.
-        Str_Par, a structure saved the parameter bounds.
+        chains, current parameter values for all chains.
+        likelihood, current log-likelihood values for all chains.
+        mpi, MPI island layout and local chain distribution.
+        nparams, number of parameters in each chain.
       Output parameters:
-        Dream, a structure saved the DREAM samples and likelihood.
-      Returm:
-        the index of the bestfit chains.
+        chains, populated with the states from every island rank.
+        likelihood, populated with the values from every island rank.
+      Return:
+        0 on success.
      ######################################################################*/
 
-    if(Mpi->Rank ==0){ 
-      fprintf(stderr, "----------DREAM SAMPLING----------\n");
-      fprintf(stderr, "generation number = %d, chain number = %d \n", \
-        Input->Num_Gener, Mpi->tot_dream);
+    if(!chains || !chains[0] || !likelihood || !mpi || nparams < 1
+        || mpi->chains_per_rank < 1 || mpi->island_comm == MPI_COMM_NULL
+        || mpi->chains_per_rank > INT_MAX/nparams)
+        return -1;
+    if(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, chains[0],
+        mpi->chains_per_rank*nparams, MPI_DOUBLE, mpi->island_comm)
+        != MPI_SUCCESS) return -1;
+    if(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, likelihood,
+        mpi->chains_per_rank, MPI_DOUBLE, mpi->island_comm)
+        != MPI_SUCCESS) return -1;
+
+    return 0;
+}
+
+static int DREAM_Allgather_Likelihood(double *likelihood, STRUCT_MPI *mpi){
+
+    /*######################################################################
+      Purpose:
+        Gather the current log-likelihood values within an island.
+      Input parameters:
+        likelihood, local and remote chain log-likelihood values.
+        mpi, MPI island layout and local chain distribution.
+      Output parameters:
+        likelihood, populated with the values from every island rank.
+      Return:
+        0 on success.
+     ######################################################################*/
+
+    if(!likelihood || !mpi || mpi->chains_per_rank < 1
+        || mpi->island_comm == MPI_COMM_NULL) return -1;
+    if(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, likelihood,
+        mpi->chains_per_rank, MPI_DOUBLE, mpi->island_comm)
+        != MPI_SUCCESS) return -1;
+
+    return 0;
+}
+
+/*--------------------------------------------------------------------------------*/
+
+static int DREAM_CENTER_PHI(double ***chains, int last_generation,
+    STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params,
+    double *best_sample){
+
+    /*######################################################################
+      Purpose:
+        Center the spherical azimuth interval on the best burn-in solution
+        and map all retained chains to the equivalent 180-degree branch.
+      Input parameters:
+        chains, circular DREAM history buffer.
+        last_generation, final burn-in generation.
+        mpi, MPI island and chain layout.
+        dream, DREAM history dimensions.
+        params, free-parameter mapping and current bounds.
+        best_sample, best sample found during burn-in.
+      Output parameters:
+        chains, with spherical azimuths mapped around the best solution.
+        params, with the azimuth bounds centered on the best solution.
+        best_sample, with its azimuth mapped into the new interval.
+      Return:
+        0 on success or when no azimuth adjustment is required; -1 for
+        invalid input.
+      Note:
+        Stokes profiles are invariant under PhiB -> PhiB+Pi. Burn-in samples
+        are discarded, so selecting one equivalent branch before production
+        sampling does not change the target distribution.
+    ######################################################################*/
+
+    if(!chains || !mpi || !dream || !params || !best_sample
+        || last_generation < 0 || dream->history_size < 1
+        || mpi->total_chains < 1) return -1;
+    if(params->magnetic_mode != MAGNETIC_SPHERICAL) return 0;
+
+    int phi_idx = -1;
+    for(int param_idx=0; param_idx<params->npar; param_idx++){
+      if(params->free_index[param_idx] == 2){
+        phi_idx = param_idx;
+        break;
+      }
+    }
+    if(phi_idx < 0) return 0;
+
+    const double old_width = params->bounds[phi_idx][1]
+        -params->bounds[phi_idx][0];
+    if(!isfinite(old_width) || old_width < M_PI*(1.0-1e-12)) return 0;
+
+    const double center = best_sample[phi_idx];
+    if(!isfinite(center)) return -1;
+    params->bounds[phi_idx][0] = center-0.5*M_PI;
+    params->bounds[phi_idx][1] = center+0.5*M_PI;
+
+    const int history_count = last_generation+1 < dream->history_size
+        ? last_generation+1 : dream->history_size;
+    const int begin_generation = last_generation+1-history_count;
+    for(int generation=begin_generation; generation<=last_generation;
+        generation++){
+      const int slot = generation%dream->history_size;
+      for(int chain_idx=0; chain_idx<mpi->total_chains; chain_idx++){
+        const double phi = chains[slot][chain_idx][phi_idx];
+        if(!isfinite(phi)) return -1;
+        chains[slot][chain_idx][phi_idx] = center+remainder(phi-center, M_PI);
+      }
+    }
+    best_sample[phi_idx] = center;
+
+    DREAM_VERBOSE(mpi, 4,
+        "PhiB bounds centered after burn-in: [%.6f, %.6f] Pi.",
+        params->bounds[phi_idx][0]/M_PI,
+        params->bounds[phi_idx][1]/M_PI);
+
+    return 0;
+}
+
+/*--------------------------------------------------------------------------------*/
+
+int INIT_DREAM(STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params, 
+    STRUCT_STK *stokes){
+
+    /*######################################################################
+      Purpose:
+        Initialize all per-profile state required by the DREAM sampler.
+      Input parameters:
+        input, DREAM controls, parameter limits, and current profile 
+          buffer.
+        mpi, initialized MPI island layout and random-number-generator 
+          states.
+        dream, zero-initialized or previously used DREAM state.
+        params, initialized spectral-line data and model workspace.
+        stokes, wavelength grid and current observed profile.
+      Output parameters:
+        dream, with the first chain generation and likelihoods 
+          initialized.
+        params, with DREAM bounds, proposal scales, and policies 
+          initialized.
+        stokes, with the current profile, initial guess, and noise 
+          initialized.
+      Return:
+        0 on success; 1 for a rejected low-intensity profile; -1 for invalid
+          configuration or allocation failure.
+     ######################################################################*/
+
+    if(!mpi || !dream || !params || !stokes) return -1;
+    const int nmodel = params->nmodel;
+    if(nmodel < 1 || nmodel > MAX_MODEL_PARAMS) return -1;
+    if(mpi->is_master || !mpi->rank_rng || mpi->total_chains < 3) return -1;
+    if(dream->burnin_generations < 2 || dream->sampling_generations < 2
+        || dream->ncr < 1 || dream->max_pairs < 1) return -1;
+    if(stokes->nw < 1 || !stokes->wavelength || !stokes->synthetic 
+        || !params->lines) return -1;
+
+    int nfree = 0;
+    for(int imodel=0; imodel<nmodel; imodel++){
+      if(params->inv[imodel]) nfree++;
+    }
+    if(nfree < 1) return -1;
+
+    if(!stokes->profile) return -1;
+
+    if(!params->bounds){
+      params->bounds = (double **)malloc(
+          (size_t)nfree*sizeof(*params->bounds));
+      if(!params->bounds) return -1;
+      params->bounds[0] = (double *)malloc(
+          (size_t)nfree*2*sizeof(**params->bounds));
+      if(!params->bounds[0]){
+        free(params->bounds);
+        params->bounds = NULL;
+        return -1;
+      }
+      for(int ipar=1; ipar<nfree; ipar++){
+        params->bounds[ipar] = params->bounds[0]+ipar*2;
+      }
     }
 
-    STRUCT_CR *Cr = (STRUCT_CR *)malloc(sizeof(STRUCT_CR));
-    Cr->Num_Cr = Input->Num_Cr;
+    if(!params->proposal_scale){
+      params->proposal_scale = (double *)malloc(
+          (size_t)nfree*sizeof(*params->proposal_scale));
+    }
+    if(!params->type){
+      params->type = (enum bounds_type *)malloc(
+          (size_t)nfree*sizeof(*params->type));
+    }
+    if(!params->narrower_guess){
+      params->narrower_guess = (bool *)malloc(
+          (size_t)nfree*sizeof(*params->narrower_guess));
+    }
+    if(!params->step){
+      params->step = (double *)malloc(
+          (size_t)nmodel*sizeof(*params->step));
+    }
+    if(!params->free_index){
+      params->free_index = (int *)malloc(
+          (size_t)nfree*sizeof(*params->free_index));
+    }
+    if(!stokes->inv_noise){
+      stokes->inv_noise = (double *)malloc(
+          (size_t)stokes->nw*4*sizeof(*stokes->inv_noise));
+    }
+    if(!params->proposal_scale || !params->type 
+        || !params->narrower_guess || !params->step || !params->free_index 
+        || !stokes->inv_noise) return -1;
+
+    params->npar = nfree;
+    dream->nparams = nfree;
+    params->bx_free_index = -1;
+    params->by_free_index = -1;
+    int ifree = 0;
+    for(int imodel=0; imodel<nmodel; imodel++){
+      if(params->limits[imodel][0] > params->limits[imodel][1]) return -1;
+      if(params->kind[imodel] != PARAM_CONTINUUM && !params->inv[imodel] 
+          && (params->value_const[imodel] 
+          < params->limits[imodel][0] || params->value_const[imodel] 
+          > params->limits[imodel][1])) return -1;
+
+      params->step[imodel] = 1e-3*(params->limits[imodel][1] 
+          -params->limits[imodel][0]);
+      if(params->inv[imodel]){
+        params->free_index[ifree] = imodel;
+        if(imodel == 1) params->bx_free_index = ifree;
+        if(imodel == 2) params->by_free_index = ifree;
+        params->type[ifree] = params->magnetic_mode == MAGNETIC_SPHERICAL 
+            && params->kind[imodel] == PARAM_B2 ? enum_fold : enum_reflect;
+        params->narrower_guess[ifree] = 
+            params->kind[imodel] == PARAM_CONTINUUM;
+        ifree++;
+      }
+    }
+
+    int status = Profile_Prepare(stokes, params);
+    if(status != 0) return status;
+
+    if(Noise_Init(stokes) != 0) return -1;
+    for(int ipar=0; ipar<nfree; ipar++){
+      int imodel = params->free_index[ipar];
+      const double lower = params->limits[imodel][0];
+      const double upper = params->limits[imodel][1];
+      const double width = upper-lower;
+      if(!isfinite(lower) || !isfinite(upper) || !isfinite(width)
+          || width < 0.0
+          || (params->type[ipar] == enum_reflect
+            && !isfinite(2.0*width))) return -1;
+      params->bounds[ipar][0] = lower;
+      params->bounds[ipar][1] = upper;
+      params->proposal_scale[ipar] = 1e-3*width;
+    }
+
+    /* Reuse the structure safely when initializing another profile. */
+    FREE_TENSOR(dream->chains);
+    FREE_MATRIX(dream->likelihood);
+
+    return Chain_Init_Dream(mpi, dream, params, stokes);
+}
+
+/*--------------------------------------------------------------------------------*/
+
+int DREAM(STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params,
+    STRUCT_STK *stokes, STRUCT_PROFILE_IO *input,
+    const STRUCT_SUBSET *subset){
+
+    /*######################################################################
+      Purpose:
+        Run the DREAM Markov-chain Monte Carlo sampler.
+      Input parameters:
+        mpi, MPI island layout and random-number-generator states.
+        dream, DREAM state, history buffers, and crossover statistics.
+        params, model parameters, bounds, and proposal scales.
+        stokes, observed Stokes profiles used by the likelihood function.
+        input, sample-file layout and parallel file handle.
+        subset, coordinates of the profile being inverted.
+      Output parameters:
+        dream, updated samples, likelihoods, and crossover statistics.
+        params, proposal scales updated after burn-in when enabled.
+      Return:
+        Best-chain index on success; -1 for invalid state, allocation, or MPI
+        failure; -2 when a non-finite numerical result is detected.
+     ######################################################################*/
+
+    if(!mpi || !dream || !params || !stokes || !input || !subset
+        || params->npar < 1
+        || params->npar != dream->nparams || !params->free_index
+        || !params->bounds || !params->proposal_scale
+        || !dream->chains.data_ptr || !dream->likelihood.data_ptr
+        || dream->history_size < 2 || dream->burnin_generations < 2
+        || dream->sampling_generations < 2
+        || mpi->total_chains < 3 || mpi->is_master
+        || mpi->island_comm == MPI_COMM_NULL) return -1;
+
+    double ***chains = TENSOR_DBL(dream->chains);
+    double **likelihood = MAT_DBL(dream->likelihood);
+    if(!chains || !likelihood) return -1;
+
+    DREAM_VERBOSE(mpi, 2, "DREAM: burn-in up to %d generations, "
+        "%d sampling generations, %d chains.", dream->burnin_generations,
+        dream->sampling_generations, mpi->total_chains);
 
     bool Converged = false;
-    int Num_Pair, Indx_Cr;
+    int npairs, cr_idx;
     int count_sample=0, count_accept=0, tot_sample=0, tot_accept=0;
-    int Indx_Chain=0, Indx_Gener, Indx_Par, Indx_Rank;
-    int Burn_in, Chain_bestfit;
-    double TMP_LIKELIHOOD, Bestliklihood;
-    double Sample[Str_Par->Num_Par], Statis_R[Str_Par->Num_Par];
-    double Bestsample[Str_Par->Num_Par];
-    double STD[Str_Par->Num_Par], Mean[Str_Par->Num_Par];
+    int chain_idx=0, generation_idx, param_idx;
+    int burnin_phase, best_chain = 0, last_generation = 0;
+    double proposed_likelihood, best_likelihood;
+    double sample[params->npar], rhat[params->npar];
+    double best_sample[params->npar];
+    double stddev[params->npar], mean[params->npar];
+    int psrf_indices[4], npsrf = 0;
+    int psrf_generation = -1;
+    bool psrf_available = false;
+    bool phi_centered = false;
+    dream->retained_generations = 0;
+    best_likelihood = -INFINITY;
 
-    Init_Cr(Cr);
+    /* Only magnetic field parameters and line-of-sight velocity participate
+       in the convergence diagnostic.  Fixed parameters have no chain index. */
+    for(param_idx=0; param_idx<params->npar; param_idx++){
+      if(params->free_index[param_idx] <= 3){
+        psrf_indices[npsrf++] = param_idx;
+      }
+    }
 
-    for(Burn_in = 0; Burn_in<2; Burn_in++){
+    int init_status = Init_Cr(dream);
+    if(mpi->island_size > 1){
+      if(MPI_Allreduce(MPI_IN_PLACE, &init_status, 1, MPI_INT, MPI_MIN,
+          mpi->island_comm) != MPI_SUCCESS) init_status = -1;
+    }
+    if(init_status != 0){
+      Free_Dream(dream);
+      return -1;
+    }
+
+    /* Chain initialization contains no collective operation, so the caller
+       can first synchronize allocation failures across the island. */
+    if(mpi->island_size > 1){
+      if(DREAM_Allgather(chains[0], likelihood[0], mpi, params->npar) != 0){
+        Free_Dream(dream);
+        return -1;
+      }
+    }
+
+    for(burnin_phase = 0; burnin_phase<2; burnin_phase++){
+      int phase_generations = burnin_phase == 0
+          ? dream->burnin_generations : dream->sampling_generations;
       count_sample=0;
       count_accept=0;
-      for(Indx_Gener=1; Indx_Gener<Input->Num_Gener; Indx_Gener++){
-        for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; \
-            Indx_Chain++){
+      last_generation = 0;
+      for(generation_idx=1; generation_idx<phase_generations;
+          generation_idx++){
+        int curr_slot = generation_idx%dream->history_size;
+        int prev_slot = (generation_idx-1)%dream->history_size;
+        int numerical_error = 0;
+        for(chain_idx=mpi->chain_begin; chain_idx<=mpi->chain_end; 
+            chain_idx++){
          
-          Num_Pair = Sample_PairNum(Input->MaxNum_Pair, Mpi);
-          Indx_Cr = Dream_Sample(Mpi, Cr, Str_Par, Num_Pair, \
-              Dream->Chains[Indx_Gener-1], Indx_Chain, Indx_Gener, Sample);
+          npairs = Sample_PairNum(dream->max_pairs, mpi);
+          cr_idx = Dream_Sample(mpi, dream, params, npairs, 
+              chains[prev_slot], chain_idx, generation_idx, sample);
           count_sample++;
-          TMP_LIKELIHOOD = Likelihood_Log(Atom, Sample, Observation);
+          if(cr_idx < 1){
+            numerical_error = -1;
+            likelihood[curr_slot][chain_idx] =
+                likelihood[prev_slot][chain_idx];
+            for(param_idx=0; param_idx<params->npar; param_idx++){
+              chains[curr_slot][chain_idx][param_idx] =
+                  chains[prev_slot][chain_idx][param_idx];
+            }
+            continue;
+          }
+          int proposal_error = 0;
+          proposed_likelihood = Likelihood_Log(sample, stokes, params,
+              &proposal_error);
+          if(proposal_error != 0) numerical_error = -1;
 
-          if(log(Ran1(Mpi->idum+Mpi->Rank))< \
-              (TMP_LIKELIHOOD-Dream->Likelihood[Indx_Gener-1][Indx_Chain])){    
+          
+          if(log(RNG_UNIFORM(mpi->rank_rng))< 
+              (proposed_likelihood-likelihood[prev_slot][chain_idx])){    
             count_accept++;
-            Dream->Likelihood[Indx_Gener][Indx_Chain] = TMP_LIKELIHOOD;
-            for(Indx_Par=0; Indx_Par<Str_Par->Num_Par; Indx_Par++){
-              Dream->Chains[Indx_Gener][Indx_Chain][Indx_Par] = Sample[Indx_Par];
+            likelihood[curr_slot][chain_idx] = proposed_likelihood;
+            for(param_idx=0; param_idx<params->npar; param_idx++){
+              chains[curr_slot][chain_idx][param_idx] = sample[param_idx];
             }
                   
           }else{
-            Dream->Likelihood[Indx_Gener][Indx_Chain] = \
-                Dream->Likelihood[Indx_Gener-1][Indx_Chain];
-            for(Indx_Par=0; Indx_Par<Str_Par->Num_Par; Indx_Par++){
-              Dream->Chains[Indx_Gener][Indx_Chain][Indx_Par] = \
-                  Dream->Chains[Indx_Gener-1][Indx_Chain][Indx_Par];
+            likelihood[curr_slot][chain_idx] = 
+                likelihood[prev_slot][chain_idx];
+            for(param_idx=0; param_idx<params->npar; param_idx++){
+              chains[curr_slot][chain_idx][param_idx] = 
+                  chains[prev_slot][chain_idx][param_idx];
             }
           }
 
-          if(Cr->Num_Cr>1 && Burn_in == 0 && Input->Cr_Update && Indx_Gener<1500){
-            Cr_distance(Dream->Chains, Mpi->tot_dream, Str_Par->Num_Par, \
-                Indx_Chain, Indx_Gener, Indx_Cr, Cr);
+          if(dream->ncr>1 && burnin_phase == 0 && dream->update_crossover
+              && generation_idx<1500){
+            if(Cr_distance(dream, mpi->total_chains, chain_idx,
+                generation_idx, cr_idx) != 0) numerical_error = -1;
           }
         }
 
-        for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-          MPI_Bcast(Dream->Chains[Indx_Gener][Indx_Rank*Mpi->num_dream], \
-              Str_Par->Num_Par*Mpi->num_dream, MPI_DOUBLE, Indx_Rank, \
-              MPI_COMM_WORLD);
-
-          MPI_Bcast(Dream->Likelihood[Indx_Gener]+Indx_Rank*Mpi->num_dream, \
-              Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD );
+        if(mpi->island_size > 1){
+          if(MPI_Allreduce(MPI_IN_PLACE, &numerical_error, 1, MPI_INT,
+              MPI_MIN, mpi->island_comm) != MPI_SUCCESS) numerical_error = -1;
+        }
+        if(numerical_error != 0){
+          if(mpi->island_rank == 0){
+            LOG_ERROR(ERR_LVL_ERROR, "DREAM",
+                "Non-finite value detected in likelihood or chain statistics.\n");
+          }
+          Free_Dream(dream);
+          return -2;
         }
 
-        if(Indx_Gener%500 == 0){
-          if(Mpi->Rank == 0) fprintf(stderr, "generation = %d \n", Indx_Gener);
+        if(mpi->island_size > 1){
+          if(DREAM_Allgather(chains[curr_slot], likelihood[curr_slot], mpi,
+              params->npar) != 0){
+            Free_Dream(dream);
+            return -1;
+          }
+        }
+        last_generation = generation_idx;
+
+        if(burnin_phase == 1
+            && (generation_idx+1)%dream->history_size == 0){
+          int first_generation = generation_idx+1-dream->history_size;
+          if(SAMPLE_WRITE_BLOCK(input, dream, params, mpi, subset,
+              first_generation, dream->history_size) != 0){
+            Free_Dream(dream);
+            return -1;
+          }
         }
 
-        if(Indx_Gener%30 == 0 && Burn_in == 0){
+        if(burnin_phase == 0){
+          for(chain_idx=0; chain_idx<mpi->total_chains; chain_idx++){
+            if(likelihood[curr_slot][chain_idx] > best_likelihood){
+              best_likelihood = likelihood[curr_slot][chain_idx];
+              best_chain = chain_idx;
+              for(param_idx=0; param_idx<params->npar; param_idx++){
+                best_sample[param_idx] = chains[curr_slot][chain_idx][param_idx];
+              }
+            }
+          }
+        }
+
+        if(generation_idx%500 == 0){
+          DREAM_VERBOSE(mpi, 2, "DREAM generation: %d", generation_idx);
+        }
+
+        if(generation_idx%30 == 0 && burnin_phase == 0){
+
+          if(params->magnetic_mode == MAGNETIC_SPHERICAL && !phi_centered){
+            if(DREAM_CENTER_PHI(chains, generation_idx, mpi, dream, params,
+                best_sample) != 0){
+              Free_Dream(dream);
+              return -1;
+            }
+            phi_centered = true;
+          }
         
-          PSRF(Mpi, Dream->Chains, Indx_Gener, Str_Par->Num_Par, Statis_R);
+          int psrf_status = PSRF(mpi, chains, generation_idx, psrf_indices, 
+              npsrf, params->npar, dream->history_size, rhat);
 
-          if(!Converged){
+          if(psrf_status == 0){
+            psrf_available = true;
+            psrf_generation = generation_idx;
+          }
+          if(psrf_status == 0 && !Converged){
             Converged = true;   
-            for(Indx_Par=0; Indx_Par<Str_Par->Num_Par; Indx_Par++){   
-              if(Statis_R[Indx_Par]>=1.2){
+            for(param_idx=0; param_idx<npsrf; param_idx++){
+              if(!(rhat[param_idx] < rhat_limit)){
                 Converged = false;          
                 break;
               }          
             }
           }
 
-          if(Input->Debug || (Converged)){
-            Chain_bestfit = BESTFIT_CHAIN(Mpi, Dream->Likelihood[Indx_Gener], \
-              Mpi->tot_dream, Dream->Chains[Indx_Gener], Str_Par->Num_Par, \
-              &Bestliklihood, Bestsample);
-            if(Mpi->Rank == 0) fprintf(stderr, \
-              "Bestfit chains: generation = %d chain index = %d likelihood = %e\n", \
-              Indx_Gener, Chain_bestfit, Bestliklihood);
-          }
-
           if(Converged){
-            if(Mpi->Rank == 0){
-              fprintf(stderr, "burn in perid finished! \n Best fit results : \n");
-              for(Indx_Par = 0; Indx_Par<Str_Par->Num_Par;Indx_Par++){
-                fprintf(stderr, " %e ", \
-                    Dream->Chains[Indx_Gener-1][Chain_bestfit][Indx_Par]);
+            DREAM_VERBOSE(mpi, 3,
+                "Best burn-in chain: chain=%d, log likelihood=%e",
+                best_chain, best_likelihood);
+            if(mpi->island_rank == 0 && mpi->verbose_level >= 3){
+              LOG_WRITE("Burn-in finished. Best-fit parameters:", true, true);
+              for(param_idx = 0; param_idx<params->npar;param_idx++){
+                snprintf(message_buffer, sizeof(message_buffer), 
+                    "parameter %d: %e", param_idx, best_sample[param_idx]);
+                LOG_WRITE(message_buffer, true, true);
               }
-              fprintf(stderr, "\n log likelihood = %e \n ", \
-                  Dream->Likelihood[Indx_Gener-1][Chain_bestfit]);
+              snprintf(message_buffer, sizeof(message_buffer), 
+                  "Log likelihood: %e", best_likelihood);
+              LOG_WRITE(message_buffer, true, true);
             }
             break;
           }
 
-          if(Cr->Num_Cr > 1 && Input->Cr_Update &&Indx_Gener<1500) Cr_Prob(Cr, Mpi);
-          if(Indx_Gener < 2000)Rm_Outlierchain(Mpi, Dream, Str_Par->Num_Par, \
-              Indx_Gener);
+          if(dream->ncr > 1 && dream->update_crossover &&generation_idx<1500
+              && Cr_Prob(dream, mpi) != 0){
+            Free_Dream(dream);
+            return -1;
+          }
+
+          if(generation_idx < 2000 
+              && Rm_Outlierchain(mpi, dream, generation_idx) < 0){
+            Free_Dream(dream);
+            return -1;
+          }
 	
         }
       }
 
-      if(Converged && Burn_in == 0){
-        for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; \
-            Indx_Chain++){
-          for(Indx_Par = 0; Indx_Par<Str_Par->Num_Par;Indx_Par++){
-            Dream->Chains[0][Indx_Chain][Indx_Par] = \
-                Dream->Chains[Indx_Gener-1][Indx_Chain][Indx_Par];
-          }
-          Dream->Likelihood[0][Indx_Chain] = \
-              Dream->Likelihood[Indx_Gener-1][Indx_Chain];
+      if(burnin_phase == 0){
+        if(!isfinite(best_likelihood)){
+          Free_Dream(dream);
+          return -1;
         }
 
-        for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-          MPI_Bcast(Dream->Chains[0][Indx_Rank*Mpi->num_dream], \
-              Str_Par->Num_Par*Mpi->num_dream, MPI_DOUBLE, Indx_Rank, \
-              MPI_COMM_WORLD);
-          MPI_Bcast(Dream->Likelihood[0]+Indx_Rank*Mpi->num_dream, \
-              Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
+        if(psrf_available){
+          DREAM_VERBOSE(mpi, 2, "Burn-in PSRF at generation %d:", 
+              psrf_generation);
+          for(int selected_idx=0; selected_idx<npsrf; selected_idx++){
+            int free_idx = psrf_indices[selected_idx];
+            int model_idx = params->free_index[free_idx];
+            char name[64];
+            MODEL_PARAMETER_NAME(params, model_idx, name, sizeof(name));
+            DREAM_VERBOSE(mpi, 2, "  %s: R-hat = %.6f", name, 
+                rhat[selected_idx]);
+          }
+        }else{
+          DREAM_VERBOSE(mpi, 2, "%s", 
+              "Burn-in PSRF unavailable: no successful PSRF evaluation " 
+              "was completed.");
+        }
+        if(!Converged){
+          DREAM_VERBOSE(mpi, 2, "Burn-in reached its maximum of %d "
+              "generations without satisfying the PSRF threshold; "
+              "continuing to sampling.", dream->burnin_generations);
+        }
+      }
+
+      if(burnin_phase == 0){
+        int final_slot = last_generation%dream->history_size;
+        for(chain_idx=mpi->chain_begin; chain_idx<=mpi->chain_end; 
+            chain_idx++){
+          for(param_idx = 0; param_idx<params->npar;param_idx++){
+            chains[0][chain_idx][param_idx] = 
+                chains[final_slot][chain_idx][param_idx];
+          }
+          likelihood[0][chain_idx] = 
+              likelihood[final_slot][chain_idx];
+        }
+
+        if(mpi->island_size > 1){
+          if(DREAM_Allgather(chains[0], likelihood[0], mpi,
+              params->npar) != 0){
+            Free_Dream(dream);
+            return -1;
+          }
         }
       
-      }else if( Burn_in == 1){
-        Chain_bestfit = BESTFIT_CHAIN(Mpi, Dream->Likelihood[Indx_Gener-1], \
-            Mpi->tot_dream, Dream->Chains[Indx_Gener-1], \
-            Str_Par->Num_Par, &Bestliklihood, Bestsample);
-        if(Mpi->Rank == 0) fprintf(stderr, \
-            "Bestfit chains: generation = %d chain index = %d likelihood = %e\n", \
-            Indx_Gener, Chain_bestfit, Bestliklihood);
-        
-	    }else{
-        for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; \
-            Indx_Chain++){
-          for(Indx_Par = 0; Indx_Par<Str_Par->Num_Par;Indx_Par++){
-            Dream->Chains[0][Indx_Chain][Indx_Par] = \
-                Dream->Chains[Indx_Gener-1][Indx_Chain][Indx_Par];
+      }else{
+        dream->retained_generations = last_generation+1;
+        int remaining_generations = dream->retained_generations
+            %dream->history_size;
+        if(remaining_generations > 0){
+          int first_generation = dream->retained_generations
+              -remaining_generations;
+          if(SAMPLE_WRITE_BLOCK(input, dream, params, mpi, subset,
+              first_generation, remaining_generations) != 0){
+            Free_Dream(dream);
+            return -1;
           }
-          Dream->Likelihood[0][Indx_Chain] = \
-              Dream->Likelihood[Indx_Gener-1][Indx_Chain];
         }
-
-        for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-          MPI_Bcast(Dream->Chains[0][Indx_Rank*Mpi->num_dream], \
-              Str_Par->Num_Par*Mpi->num_dream, MPI_DOUBLE, \
-              Indx_Rank, MPI_COMM_WORLD);
-          MPI_Bcast(Dream->Likelihood[0]+Indx_Rank*Mpi->num_dream, \
-              Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
+        int history_count = dream->retained_generations<dream->history_size 
+            ? dream->retained_generations : dream->history_size;
+        int begin_generation = dream->retained_generations-history_count;
+        int best_generation = begin_generation;
+        best_chain = 0;
+        if(mpi->island_rank == 0){
+          for(int retained_generation=begin_generation; 
+              retained_generation<=last_generation; retained_generation++){
+            int slot = retained_generation%dream->history_size;
+            for(chain_idx=0; chain_idx<mpi->total_chains; chain_idx++){
+              int best_slot = best_generation%dream->history_size;
+              if(likelihood[slot][chain_idx] 
+                  > likelihood[best_slot][best_chain]){
+                best_generation = retained_generation;
+                best_chain = chain_idx;
+              }
+            }
+          }
+        }
+        if(mpi->island_size > 1){
+          if(MPI_Bcast(&best_generation, 1, MPI_INT, 0, mpi->island_comm)
+              != MPI_SUCCESS
+              || MPI_Bcast(&best_chain, 1, MPI_INT, 0, mpi->island_comm)
+              != MPI_SUCCESS){
+            Free_Dream(dream);
+            return -1;
+          }
+        }
+        int best_slot = best_generation%dream->history_size;
+        best_likelihood = likelihood[best_slot][best_chain];
+        for(param_idx=0; param_idx<params->npar; param_idx++){
+          best_sample[param_idx] = chains[best_slot][best_chain][param_idx];
+        }
+        DREAM_VERBOSE(mpi, 2, 
+            "Sampling finished: generation=%d, best generation=%d, " 
+            "best chain=%d, log likelihood=%e", last_generation, 
+            best_generation, best_chain, best_likelihood);
+        if(mpi->island_rank == 0 && mpi->verbose_level >= 2){
+          double best_model[MAX_MODEL_PARAMS];
+          for(int model_idx=0; model_idx<params->nmodel; model_idx++){
+            best_model[model_idx] = params->value_const[model_idx];
+          }
+          for(param_idx=0; param_idx<params->npar; param_idx++){
+            best_model[params->free_index[param_idx]] = best_sample[param_idx];
+          }
+          LOG_WRITE("Best-fit model parameters:", true, true);
+          for(int model_idx=0; model_idx<params->nmodel; model_idx++){
+            char name[64];
+            MODEL_PARAMETER_NAME(params, model_idx, name, sizeof(name));
+            DREAM_VERBOSE(mpi, 2, "  %s = %.10e%s", name, 
+                best_model[model_idx], 
+                params->inv[model_idx] ? "" : " (fixed)");
+          }
         }
       }
 
-      MPI_Allreduce(&count_sample, &tot_sample, 1, MPI_INT, \
-          MPI_SUM, MPI_COMM_WORLD);
-      MPI_Allreduce(&count_accept, &tot_accept, 1, MPI_INT, \
-          MPI_SUM, MPI_COMM_WORLD);
-
-      tot_accept += Mpi->tot_dream;
-      tot_sample += Mpi->tot_dream;
-	    if(Mpi->Rank == 0) {
-        fprintf(stderr, "accepted samples: %d \n", tot_accept);
-        fprintf(stderr, "total samples: %d \n", tot_sample);
-        fprintf(stderr, "acceptance rated: %.1f %%\n", \
-            tot_accept*100./tot_sample);
+      if(MPI_Allreduce(&count_sample, &tot_sample, 1, MPI_INT, MPI_SUM,
+          mpi->island_comm) != MPI_SUCCESS
+          || MPI_Allreduce(&count_accept, &tot_accept, 1, MPI_INT, MPI_SUM,
+          mpi->island_comm) != MPI_SUCCESS){
+        Free_Dream(dream);
+        return -1;
       }
-      if(Input->Distribution_Update && Burn_in == 0){
-        Chains_STD(Mpi, Indx_Gener*3/4, Indx_Gener-1, \
-            Str_Par->Num_Par, Dream->Chains, STD, Mean);
-        if(Mpi->Rank == 0){
-          for(Indx_Par = 0; Indx_Par<Str_Par->Num_Par; Indx_Par++){
-            fprintf(stderr, "%d %e %e %e %e\n", Indx_Par, \
-                Dream->Chains[Indx_Gener-1][Chain_bestfit][Indx_Par], \
-                Mean[Indx_Par], STD[Indx_Par], STD[Indx_Par] \
-                /(Str_Par->Par_Bounds[Indx_Par][1] \
-                -Str_Par->Par_Bounds[Indx_Par][0]));
-            Str_Par->Distribution[Indx_Par] = STD[Indx_Par];
+
+      DREAM_VERBOSE(mpi, 2, 
+          "%s acceptance probability: %.2f%% (%d accepted / %d proposed).", 
+          burnin_phase == 0 ? "Burn-in" : "Sampling", 
+          tot_sample > 0 ? tot_accept*100.0/tot_sample : 0.0, 
+          tot_accept, tot_sample);
+
+      if(burnin_phase == 0 && params->magnetic_mode == MAGNETIC_SPHERICAL){
+        if(DREAM_CENTER_PHI(chains, last_generation, mpi, dream, params,
+            best_sample) != 0){
+          Free_Dream(dream);
+          return -1;
+        }
+      }
+
+      if(dream->update_proposal_noise && burnin_phase == 0){
+        int begin_stats = last_generation*3/4;
+        if(last_generation-begin_stats+1 > dream->history_size){
+          begin_stats = last_generation+1-dream->history_size;
+        }
+        if(Chains_STD(mpi, begin_stats, last_generation, params->npar,
+            chains, dream->history_size, stddev, mean) != 0){
+          Free_Dream(dream);
+          return -1;
+        }
+        if(mpi->island_rank == 0 && mpi->verbose_level >= 4){
+          for(param_idx = 0; param_idx<params->npar; param_idx++){
+            snprintf(message_buffer, sizeof(message_buffer), 
+                "parameter %d: best=%e, mean=%e, std=%e, normalized std=%e", 
+                param_idx, best_sample[param_idx],
+                mean[param_idx], stddev[param_idx], stddev[param_idx] 
+                /(params->bounds[param_idx][1] 
+                -params->bounds[param_idx][0]));
+            LOG_WRITE(message_buffer, true, true);
           }
+        }
+        for(param_idx = 0; param_idx<params->npar; param_idx++){
+          params->proposal_scale[param_idx] = stddev[param_idx];
         }
       }      
     }
 
-    FREE_VECTOR(Cr->Cr, 1, enum_dbl);
-    FREE_VECTOR(Cr->Prob, 1, enum_dbl);
-    FREE_VECTOR(Cr->Delta, 1, enum_dbl);
-    FREE_VECTOR(Cr->Delta_tot, 1, enum_dbl);
-    FREE_VECTOR(Cr->Delta_sum, 1, enum_dbl);
-    FREE_VECTOR(Cr->counts, 1, enum_int);
-    FREE_VECTOR(Cr->counts_tot, 1, enum_int);
-    FREE_VECTOR(Cr->counts_sum, 1, enum_int);
-    free(Cr);
-
-    return Chain_bestfit;
+    Free_Dream(dream);
+    return best_chain;
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Chain_Init_Dream(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, \
-    STRUCT_DREAM *Dream, STRUCT_ATOM *Atom, \
-    STRUCT_OBSERVATION *Observation, STRUCT_PAR *Str_Par){
+static int Chain_Init_Dream(STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params, 
+    STRUCT_STK *stokes){
     
     /*######################################################################
       Purpose:
-        Initialize the model parameters in DREAM chains.
-      Record of revisions:
-        10 Oct. 2022.
+        Initialize DREAM chain states and their log-likelihoods.
       Input parameters:
-        Input, a structure saved the input information.
-        Mpi, a structure saved the Mpi information.
-        Dream, a structure saved the DREAM samples and likelihood.
-        Atom, a structure the atomic information
-        Observation, a structure saved observed profile.
-        Str_Par, a structure saved the parameter bounds.
+        input, runtime controls including the requested generation count.
+        mpi, MPI island layout and local chain range.
+        params, model parameter bounds and initialization controls.
+        stokes, observed Stokes profiles used by the likelihood function.
       Output parameters:
-        Dream, a structure saved the DREAM samples and likelihood.
+        dream, allocated history buffers containing the initial chain states.
+      Return:
+        0 on success.
      ######################################################################*/
 
-    int Indx_Rank, Indx_Par, Indx_Chain;
+    int param_idx, chain_idx;
 
-    Dream->Chains = (double ***)TENSOR_DBL(0, Input->Num_Gener-1, 0, \
-        Mpi->tot_dream-1, 0, Str_Par->Num_Par-1, true);
-    Dream->Likelihood = (double **)MATRIX(0, Input->Num_Gener-1, 0, \
-        Mpi->tot_dream-1, enum_dbl, false);
+    int max_generations = dream->burnin_generations
+        > dream->sampling_generations ? dream->burnin_generations
+        : dream->sampling_generations;
+    dream->history_size = max_generations < DREAM_HISTORY_MAX
+        ? max_generations : DREAM_HISTORY_MAX;
+    if(dream->history_size < 2) dream->history_size = 2;
 
-    for(Indx_Chain = Mpi->indxb_dream; Indx_Chain <= Mpi->indxe_dream; \
-        Indx_Chain++){
-      for(Indx_Par = 0; Indx_Par < Str_Par->Num_Par; Indx_Par++){
-        if(Str_Par->narrower_guess[Indx_Par]){
-          Dream->Chains[0][Indx_Chain][Indx_Par] = \
-              (Ran1(Mpi->idum+Mpi->Rank)-0.5) \
-              *(Str_Par->Par_Bounds[Indx_Par][1] \
-              -Str_Par->Par_Bounds[Indx_Par][0])*0.3 \
-              +Str_Par->Par_Bounds[Indx_Par][0]*1.5 \
-              +Str_Par->Par_Bounds[Indx_Par][1]*0.5;
-        }else{
-           Dream->Chains[0][Indx_Chain][Indx_Par] = \
-              (Ran1(Mpi->idum+Mpi->Rank)-0.5) \
-              *(Str_Par->Par_Bounds[Indx_Par][1] \
-              -Str_Par->Par_Bounds[Indx_Par][0]) \
-              +Str_Par->Par_Bounds[Indx_Par][0]*1.5\
-                +Str_Par->Par_Bounds[Indx_Par][1]*0.5;
-        }
-      }
-      Dream->Likelihood[0][Indx_Chain] = Likelihood_Log(Atom, \
-          Dream->Chains[0][Indx_Chain], Observation);
+    dream->chains = TENSOR(0, dream->history_size-1, 0, 
+        mpi->total_chains-1, 0, params->npar-1, enum_dbl, true);
+    dream->likelihood = MATRIX(0, dream->history_size-1, 0, 
+        mpi->total_chains-1, enum_dbl, false);
+
+    if(!dream->chains.data_ptr || !dream->likelihood.data_ptr){
+      FREE_TENSOR(dream->chains);
+      FREE_MATRIX(dream->likelihood);
+      return -1;
     }
 
-    for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-      MPI_Bcast(Dream->Chains[0][Indx_Rank*Mpi->num_dream], \
-          Str_Par->Num_Par*Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
-      MPI_Bcast(Dream->Likelihood[0]+Indx_Rank*Mpi->num_dream, \
-          Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD );
+    double ***chains = TENSOR_DBL(dream->chains);
+    double **likelihood = MAT_DBL(dream->likelihood);
+
+    for(chain_idx = mpi->chain_begin; chain_idx <= mpi->chain_end; 
+        chain_idx++){
+      for(param_idx = 0; param_idx < params->npar; param_idx++){
+        if(params->narrower_guess[param_idx]){
+          chains[0][chain_idx][param_idx] = 
+              (RNG_UNIFORM(mpi->rank_rng)-0.5) 
+              *(params->bounds[param_idx][1] 
+              -params->bounds[param_idx][0])*0.3 
+              +0.5*(params->bounds[param_idx][0] 
+              +params->bounds[param_idx][1]);
+        }else{
+           chains[0][chain_idx][param_idx] = 
+              RNG_UNIFORM(mpi->rank_rng) 
+              *(params->bounds[param_idx][1] 
+              -params->bounds[param_idx][0]) 
+              +params->bounds[param_idx][0];
+        }
+      }
+      int numerical_error = 0;
+      likelihood[0][chain_idx] = Likelihood_Log(chains[0][chain_idx],
+          stokes, params, &numerical_error);
+      if(numerical_error != 0) return -2;
     }
 
     return 0;    
 }
 
-/*--------------------------------------------------------------------------------*/
 
-extern int GEMC2DREAM(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, STRUCT_GEMC *Gemc, \
-    STRUCT_DREAM *Dream, STRUCT_PAR *Str_Par, \
-    STRUCT_OBSERVATION *Observation, STRUCT_ATOM *Atom){
-
-    /*######################################################################
-      Purpose:
-        Initialized the DREAM chains with the results from GEMC.
-      Record of revisions:
-        30 Otc. 2022.
-      Input parameters:
-        Input, a structure saved the input information.
-        Mpi, a structure saved the Mpi information.
-        Gemc, a structure saved the GEMC samples and likelihood.
-        Dream, a structure saved the DREAM samples and likelihood.
-        Str_Par, a structure saved the model parameters, bounds.
-        Observation, a structure saved the lambda.
-        Atom, a structure saved the Landu facor.
-      Output parameters:
-        Sample, the sampled model parameters.
-     ######################################################################*/
-
-    int indx[Mpi->tot_gemc];
-        
-    if(Mpi->Rank == 0) qsort_index(0, Mpi->tot_gemc-1, \
-        Gemc->Likelihood, indx);
-
-    MPI_Bcast(indx, Mpi->tot_gemc, MPI_INT, 0, MPI_COMM_WORLD);
-    Dream->Chains = (double ***)TENSOR_DBL(0, Input->Num_Gener-1, 0, \
-      Mpi->tot_dream-1, 0, Str_Par->Num_Par-1, true);
-    Dream->Likelihood = (double **)MATRIX(0, Input->Num_Gener-1, 0, \
-      Mpi->tot_dream-1, enum_dbl, false);
-
-    int Indx_Rank, Indx_Par, Indx_Chain, i;
-    
-    for(Indx_Chain=0, i = Mpi->tot_gemc-Mpi->tot_dream; \
-      Indx_Chain<Mpi->tot_dream; Indx_Chain++, i++){
-      for(Indx_Par = 0; Indx_Par<Str_Par->Num_Par;Indx_Par++){
-        Dream->Chains[0][Indx_Chain][Indx_Par] = \
-            Gemc->Chains[indx[i]][Indx_Par];
-      }
-      Dream->Likelihood[0][Indx_Chain] = Gemc->Likelihood[indx[i]];
-    }
-
-    if(Observation->weights_flag){
-      Observation->weights_flag = false;
-      for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; \
-          Indx_Chain++){
-        Dream->Likelihood[0][Indx_Chain]=Likelihood_Log(Atom, \
-            Dream->Chains[0][Indx_Chain], Observation);
-      }
-      for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-        MPI_Bcast(Dream->Likelihood[0]+Indx_Rank*Mpi->num_dream, \
-            Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD );
-      }
-    }
-      
-    return 0;
-}
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Dream_Sample(STRUCT_MPI *Mpi, STRUCT_CR *Cr, STRUCT_PAR *Str_Par, \
-    int Num_Pair, double **Chains, int Indx_Chain, int indx_Gener, \
-    double *Sample){
+static int Dream_Sample(STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params, 
+    int npairs, double **chains, int chain_idx, int generation_idx, 
+    double *sample){
     
     /*######################################################################
       Purpose:
-        Sample the model parameters.
-      Record of revisions:
-        30 Otc. 2022.
+        Generate one DREAM proposal for the selected chain.
       Input parameters:
-        Mpi, a structure saved the Mpi information.
-        Cr, a structure saved the Cr information.
-        Str_Par, a structure saved the model parameters, bounds.
-        Num_Pair, the number of pairs of crossover chains.
-        Chains[][], the sampled model parameters in the specified.
-        Indx_Chain, index of the chains.
+        mpi, MPI state and random-number-generator states.
+        dream, DREAM crossover and proposal work arrays.
+        params, model parameter bounds and proposal scales.
+        npairs, number of chain pairs used for the differential jump.
+        chains, current states of all chains.
+        chain_idx, index of the chain being updated.
+        generation_idx, current generation index.
       Output parameters:
-        Sample, the sampled model parameters.
+        sample, generated proposal after enforcing parameter bounds.
+      Return:
+        Index of the crossover value used for the proposal.
      ######################################################################*/
     
-    int *Jump_dim = VECTOR(0, Str_Par->Num_Par-1, enum_int, false);
-    double *Diff = VECTOR(0, Str_Par->Num_Par-1, enum_dbl, false);
+    if(!mpi || !dream || !params || !chains || !sample || npairs < 1
+        || chain_idx < 0 || chain_idx >= mpi->total_chains
+        || generation_idx < 1 || dream->nparams != params->npar
+        || dream->nparams < 1) return -1;
 
-    int Indx_Cr = Sample_Cr(Cr, Mpi);
+    int cr_idx = Sample_Cr(dream, mpi);
+    if(cr_idx < 1 || cr_idx > dream->ncr) return -1;
 
-    int Num_Jump = Dream_Dim(Mpi, Cr, Str_Par, Indx_Cr, Jump_dim);
+    int njump = Dream_Dim(mpi, dream, cr_idx);
+    if(njump < 1 || njump > dream->nparams) return -1;
 
-    Dream_Diff(Mpi, Chains, Indx_Chain, Num_Pair, Num_Jump, Jump_dim, Diff);
+    if(Dream_Diff(mpi, chains, chain_idx, npairs, njump,
+        dream->jump_dims, dream->diff) != 0) return -1;
 
-    double *Factor_E = VECTOR(0, Num_Jump-1, enum_dbl, false);
-    double *Factor_Epsilon = VECTOR(0, Num_Jump-1, enum_dbl, false);
-
-    int i, Indx_Par;
+    int i, param_idx;
     double gamma; 
 
-    for(i=0; i<Num_Jump; i++){    
-      Factor_E[i]=(Ran1(Mpi->idum+Mpi->Rank)-0.5)*0.1;
-      Factor_Epsilon[i]=GASDEV(Mpi->idum+Mpi->Rank) \
-          *Str_Par->Distribution[Jump_dim[i]]*1e-5;
+    for(i=0; i<njump; i++){    
+      dream->scale_noise[i]=(RNG_UNIFORM(mpi->rank_rng)-0.5)*0.1;
+      dream->additive_noise[i]=RNG_GAUSS(mpi->rank_rng) 
+          *params->proposal_scale[dream->jump_dims[i]]*1e-5;
     }
       
-    for(Indx_Par=0; Indx_Par<Str_Par->Num_Par; Indx_Par++){
-      Sample[Indx_Par] = Chains[Indx_Chain][Indx_Par];
+    for(param_idx=0; param_idx<params->npar; param_idx++){
+      sample[param_idx] = chains[chain_idx][param_idx];
     }
     
-    if(indx_Gener%5==0){
-      gamma = 1;
-    }else if(Str_Par->Num_Par > Num_Jump){
-      //gamma = 2.38/sqrt(2.*Num_Pair*(Str_Par->Num_Par-Num_Jump));
-      gamma = 2.38/sqrt(2.*Num_Pair*(Str_Par->Num_Par));
+    if(generation_idx%5==0){
+      gamma = 1.0;
     }else{
-      gamma = 2.38/sqrt(2.*Num_Pair*(Str_Par->Num_Par));
+      gamma = 2.38/sqrt(2.0*npairs*params->npar);
     }
     
-    //Num_Jump
-    for(i=0; i<Num_Jump; i++){
-      Sample[Jump_dim[i]] += Diff[i]*(1.0+Factor_E[i])*gamma \
-        +Factor_Epsilon[i]; 
+    for(i=0; i<njump; i++){
+      sample[dream->jump_dims[i]] += dream->diff[i]*(1.0+dream->scale_noise[i])*gamma 
+        +dream->additive_noise[i]; 
     }
 
-    Bounds_Enforce(Sample, Str_Par);
+    if(Bounds_Enforce(sample, params) != 0) return -1;
     
-    FREE_VECTOR(Jump_dim, 0, enum_int);
-    FREE_VECTOR(Diff, 0, enum_dbl);
-    FREE_VECTOR(Factor_E, 0, enum_dbl);
-    FREE_VECTOR(Factor_Epsilon, 0, enum_dbl);
 
-    return Indx_Cr;
+
+    return cr_idx;
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Dream_Dim(STRUCT_MPI *Mpi, STRUCT_CR *Cr, STRUCT_PAR *Str_Par, \
-    int Indx_Cr, int *Jump_dim){
+static int Dream_Dim(STRUCT_MPI *mpi, STRUCT_DREAM *dream, int cr_idx){
     
     /*######################################################################
       Purpose:
-        Choose the dimensions in which a jump is to be made.
-      Record of revisions:
-        30 Otc. 2022
+        Select the parameter dimensions included in a DREAM jump.
       Input parameters:
-        Mpi, a structure saved the Mpi information.
-        Cr, a structure saved the Cr information.
-        Str_Par, a structure saved the model parameters, bounds.
-        Indx_Cr, index of the choosed Cr.
+        mpi, MPI state and random-number-generator states.
+        dream, DREAM crossover values.
+        params, model parameter metadata.
+        cr_idx, index of the selected crossover value.
       Output parameters:
-        Jump_dim, a vector which saves the indexs of jumping parameters.
+        jump_dims, indices of the selected parameter dimensions.
+      Return:
+        Number of selected dimensions.
      ######################################################################*/
     
-    int i=0, Num_Jump=0;
+    if(!mpi || !dream || !mpi->rank_rng || !dream->jump_dims
+        || !dream->crossover || dream->nparams < 1 || cr_idx < 1
+        || cr_idx > dream->ncr) return -1;
+
+    int i=0, njump=0;
     
-    for(i=0; i<Str_Par->Num_Par; i++){
-      Jump_dim[i] = -1;  
+    for(i=0; i<dream->nparams; i++){
+      dream->jump_dims[i] = -1;
     }
     
-    for(i=0; i<Str_Par->Num_Par; i++){
-      if(Ran1(Mpi->idum+Mpi->Rank)<=1.0-Cr->Cr[Indx_Cr]){
-        Jump_dim[Num_Jump] = i;
-        Num_Jump++;
+    for(i=0; i<dream->nparams; i++){
+      if(RNG_UNIFORM(mpi->rank_rng)<=dream->crossover[cr_idx]){
+        dream->jump_dims[njump] = i;
+        njump++;
       }  
     }
     
-    if(Num_Jump==0){
-        Jump_dim[0]=(int)(Ran1(Mpi->idum+Mpi->Rank)*Str_Par->Num_Par);
-        Num_Jump = 1;
+    if(njump==0){
+        dream->jump_dims[0]=(int)(RNG_UNIFORM(mpi->rank_rng) 
+            *dream->nparams);
+        njump = 1;
     }
     
-    return Num_Jump;
+    return njump;
     
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Dream_Diff(STRUCT_MPI *Mpi, double **Chains, int Indx_Chain, \
-    int Num_Pair, int Num_Jump, int *Jump_dim, double *Diff){
+static int Dream_Diff(STRUCT_MPI *mpi, double **chains, int chain_idx, int npairs, 
+    int njump, int *jump_dims, double *diff){
     
     /*######################################################################
       Purpose:
-        Calculate the pairs differences used to sample new candidates.
-      Record of revisions:
-        30 Otc. 2022
+        Calculate differential-evolution jumps from random chain pairs.
       Input parameters:
-        Mpi, a structure saved the Mpi information.
-        Chains[][], the sampled model parameters in the specified 
-          generation.
-        Indx_Chain, the index of the current chain.
-        Num_Pair, the number of pairs of crossover chains.
-        Num_Jump, the number of dimensions in which a jump will be made.
-        Jump_dim, the dimensions in which a jump is to be made.
+        mpi, MPI state and random-number-generator states.
+        chains, current states of all chains.
+        chain_idx, index of the current chain, which cannot be selected.
+        npairs, number of random chain pairs.
+        njump, number of dimensions in the jump.
+        jump_dims, indices of the dimensions in the jump.
       Output parameters:
-        Diff[], a vector which saves pairs differences.
+        diff, summed pair differences for the selected dimensions.
+      Return:
+        0 on success.
      ######################################################################*/
         
-    int Pairs[2*Num_Pair];
-    int i, j;
-    int tmp1, tmp2;
-
-    for(i=0; i<Num_Pair; i++){
-      do{      
-        tmp1 = (int)(Ran1(Mpi->idum+Mpi->Rank)*Mpi->tot_dream);    
-        tmp2 = (int)(Ran1(Mpi->idum+Mpi->Rank)*Mpi->tot_dream);
-      }while(tmp1==tmp2||tmp1==Indx_Chain||tmp2==Indx_Chain);
-        
-      Pairs[i*2] = tmp1;      
-      Pairs[i*2+1] = tmp2;
+    if(!mpi || !mpi->rank_rng || !chains || !jump_dims || !diff
+        || mpi->total_chains < 3 || chain_idx < 0
+        || chain_idx >= mpi->total_chains || npairs < 1
+        || 2LL*npairs > (long long)mpi->total_chains-1 || njump < 1) return -1;
+    for(int i=0; i<njump; i++){
+      if(jump_dims[i] < 0) return -1;
     }
 
-    for(i=0; i<Num_Jump; i++){   
-      Diff[i] = 0;
-  //    if (Mpi->Rank ==0) fprintf(stderr, "%d ", Jump_dim[i]);
-      for(j=0; j<Num_Pair; j++){
-        Diff[i] += Chains[Pairs[j*2]][Jump_dim[i]] \
-            -Chains[Pairs[j*2+1]][Jump_dim[i]];
-     //   if (Mpi->Rank ==0) fprintf(stderr, "%e %e %e ", Chains[Pairs[j*2]][Jump_dim[i]], Chains[Pairs[j*2+1]][Jump_dim[i]],Diff[i]);
+    int Pairs[2*npairs];
+    int i, j;
+
+    /* Select all differential chains without replacement. */
+    for(i=0; i<2*npairs; i++){
+      int candidate;
+      bool duplicate;
+      do{
+        candidate = (int)(RNG_UNIFORM(mpi->rank_rng) 
+            *mpi->total_chains);
+        duplicate = candidate == chain_idx;
+        for(j=0; j<i && !duplicate; j++){
+          duplicate = candidate == Pairs[j];
+        }
+      }while(duplicate);
+      Pairs[i] = candidate;
+    }
+
+    for(i=0; i<njump; i++){   
+      diff[i] = 0;
+      for(j=0; j<npairs; j++){
+        diff[i] += chains[Pairs[j*2]][jump_dims[i]] 
+            -chains[Pairs[j*2+1]][jump_dims[i]];
       }     
-     // if (Mpi->Rank ==0)fprintf(stderr, "\n ");
     }
     
     return 0;
@@ -514,90 +984,116 @@ extern int Dream_Diff(STRUCT_MPI *Mpi, double **Chains, int Indx_Chain, \
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Cr_distance(double ***Chains, int Num_Chain, int Num_Par, \
-    int Indx_Chain, int Indx_Gener, int Indx_Cr, STRUCT_CR *Cr){
+static int Cr_distance(STRUCT_DREAM *dream, int nchains, int chain_idx, 
+    int generation_idx, int cr_idx){
     
     /*######################################################################
       Purpose:
         Compute the squared normalized jumping distance.
-      Record of revisions:
-        30 Otc. 2022
       Input parameters:
-        Chains[][][], the sampled model parameters.
-        Num_Chain, the number of chains
-        Num_Par, the number of model parameters.
-        Indx_Chain, the index of current chain.
-        Indx_Gener, the index of current generation.
-        Indx_Cr, the index of CR value choosed.
-        Cr, a structure saved the Cr information.
+        chains, circular history of sampled model parameters.
+        nchains, the number of chains
+        nparams, the number of model parameters.
+        chain_idx, the index of current chain.
+        generation_idx, the index of current generation.
+        cr_idx, the index of CR value chosen.
+        history_size, number of generations retained in the circular history.
+        dream, DREAM crossover-distance accumulators.
       Output parameters:
-        Cr, a structure saved the Cr information.
+        dream, with the selected crossover accumulator and count updated.
+      Return:
+        0 on success.
      ######################################################################*/
     
-    int Indx_Par;
-    double STD[Num_Par], Mean[Num_Par];
+    int param_idx;
+    int nparams = dream->nparams;
+    int history_size = dream->history_size;
+    double ***chains = TENSOR_DBL(dream->chains);
+    double stddev[nparams], mean[nparams];
 
-    Chains_STD_Single(Num_Chain, Indx_Gener-1, Indx_Gener-1, Num_Par, Chains, \
-        STD, Mean);
+    if(Chains_STD_Single(nchains, generation_idx-1, generation_idx-1,
+        nparams, chains, history_size, stddev, mean) != 0) return -1;
+
+    int curr_slot = generation_idx%history_size;
+    int prev_slot = (generation_idx-1)%history_size;
     
-    for(Indx_Par=0; Indx_Par<Num_Par; Indx_Par++){ 
-      Cr->Delta[Indx_Cr] += pow((Chains[Indx_Gener][Indx_Chain][Num_Par] \
-        -Chains[Indx_Gener-1][Indx_Chain][Num_Par])/STD[Indx_Par],2);
+    for(param_idx=0; param_idx<nparams; param_idx++){ 
+      if(stddev[param_idx] > 0.0){
+        dream->delta[cr_idx] += pow( 
+            (chains[curr_slot][chain_idx][param_idx] 
+            -chains[prev_slot][chain_idx][param_idx])/stddev[param_idx], 2);
+      }
     }
     
-    Cr->counts[Indx_Cr]++;
+    dream->counts[cr_idx]++;
 
     return 0 ; 
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Cr_Prob(STRUCT_CR *Cr, STRUCT_MPI *Mpi){
+static int Cr_Prob(STRUCT_DREAM *dream, STRUCT_MPI *mpi){
     
     /*######################################################################
       Purpose:
-        Update the probability of each individual CR values.
-      Record of revisions:
-        30 Otc. 2022
+        Update the sampling probability of each crossover value.
       Input parameters:
-        Cr, a structure saved the Cr information.
-        Mpi, a structure saved the Mpi information.
+        dream, crossover statistics accumulated by the local rank.
+        mpi, MPI island communicator and rank information.
       Output parameters:
-        Cr, a structure saved the Cr information.
-
+        dream, synchronized crossover totals and updated probabilities.
+      Return:
+        0 on success.
      ######################################################################*/
     
     int i;
-    double Tot_Prob=0, Tot_Dis=0;
+    double total_score=0.0;
 
-    MPI_Allreduce(Cr->Delta+1, Cr->Delta_sum+1, Cr->Num_Cr, MPI_DOUBLE, \
-        MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(Cr->counts+1, Cr->counts_sum+1, Cr->Num_Cr, MPI_INT, \
-        MPI_SUM, MPI_COMM_WORLD);
+    if(!dream || !mpi || dream->ncr < 1 || !dream->delta
+        || !dream->delta_sum || !dream->delta_total || !dream->counts
+        || !dream->counts_sum || !dream->counts_total
+        || !dream->probabilities) return -1;
+    if(MPI_Allreduce(dream->delta+1, dream->delta_sum+1, dream->ncr,
+        MPI_DOUBLE, MPI_SUM, mpi->island_comm) != MPI_SUCCESS
+        || MPI_Allreduce(dream->counts+1, dream->counts_sum+1, dream->ncr,
+        MPI_INT, MPI_SUM, mpi->island_comm) != MPI_SUCCESS) return -1;
 
-    if(Mpi->Rank == 0){
-      for(i=1; i<=Cr->Num_Cr; i++){
-        Cr->Delta_tot[i] += Cr->Delta_sum[i];
-        Cr->counts_tot[i] += Cr->counts_sum[i];
-        Tot_Dis += Cr->Delta_tot[i];
+    if(mpi->island_rank == 0){
+      for(i=1; i<=dream->ncr; i++){
+        dream->delta_total[i] += dream->delta_sum[i];
+        dream->counts_total[i] += dream->counts_sum[i];
+        if(dream->counts_total[i] > 0){
+          dream->probabilities[i] = dream->delta_total[i] 
+              /dream->counts_total[i];
+          total_score += dream->probabilities[i];
+        }else{
+          dream->probabilities[i] = 0.0;
+        }
       }
 
-      for(i=1; i<=Cr->Num_Cr; i++){
-        Cr->Prob[i] = Cr->Delta_tot[i]/Cr->counts_tot[i]/Tot_Dis;
-        Tot_Prob += Cr->Prob[i];
-      }
-      for(i=1; i<=Cr->Num_Cr; i++){        
-        Cr->Prob[i] /= Tot_Prob;
+      if(total_score > 0.0){
+        for(i=1; i<=dream->ncr; i++){
+          dream->probabilities[i] /= total_score;
+        }
+      }else{
+        for(i=1; i<=dream->ncr; i++){
+          dream->probabilities[i] = 1.0/dream->ncr;
+        }
       }
     }
 
-    MPI_Bcast(Cr->counts_tot+1, Cr->Num_Cr, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(Cr->Delta_tot+1, Cr->Num_Cr, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-    MPI_Bcast(Cr->Prob+1, Cr->Num_Cr, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if(mpi->island_size > 1){
+      if(MPI_Bcast(dream->counts_total+1, dream->ncr, MPI_INT, 0,
+          mpi->island_comm) != MPI_SUCCESS
+          || MPI_Bcast(dream->delta_total+1, dream->ncr, MPI_DOUBLE, 0,
+          mpi->island_comm) != MPI_SUCCESS
+          || MPI_Bcast(dream->probabilities+1, dream->ncr, MPI_DOUBLE, 0,
+          mpi->island_comm) != MPI_SUCCESS) return -1;
+    }
 
-    for(i=1; i<=Cr->Num_Cr; i++){
-      Cr->Delta[i] = 0;
-      Cr->counts[i] = 0;
+    for(i=1; i<=dream->ncr; i++){
+      dream->delta[i] = 0;
+      dream->counts[i] = 0;
     }
    
     return 0;
@@ -605,36 +1101,66 @@ extern int Cr_Prob(STRUCT_CR *Cr, STRUCT_MPI *Mpi){
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Init_Cr(STRUCT_CR *Cr){
+static int Init_Cr(STRUCT_DREAM *dream){
     
     /*######################################################################
       Purpose:
         Initialize the CR (crossover probability) values.
-      Record of revisions:
-        30 Otc. 2022
       Input parameters:
-        .
+        dream, DREAM state with ncr already configured.
+        npar, number of model parameters.
       Output parameters:
-        Cr, a structure saved the Cr information.
+        dream, with crossover statistics and proposal work arrays allocated.
+      Return:
+        0 on success.
      ######################################################################*/
     
-    Cr->Cr=VECTOR(1, Cr->Num_Cr, enum_dbl, false);
-    Cr->Prob=VECTOR(1, Cr->Num_Cr, enum_dbl, false);
-    Cr->Delta=VECTOR(1, Cr->Num_Cr, enum_dbl, false);
-    Cr->counts=VECTOR(1, Cr->Num_Cr, enum_int, false);
-    Cr->Delta_sum=VECTOR(1, Cr->Num_Cr, enum_dbl, false);
-    Cr->counts_sum=VECTOR(1, Cr->Num_Cr, enum_int, false);
-    Cr->Delta_tot=VECTOR(1, Cr->Num_Cr, enum_dbl, false);
-    Cr->counts_tot=VECTOR(1, Cr->Num_Cr, enum_int, false);
+    if(!dream || dream->ncr < 1 || dream->nparams < 1) return -1;
+    Free_Dream(dream);
+
+    dream->crossover = (double *)calloc((size_t)dream->ncr+1, sizeof(double));
+    dream->probabilities = (double *)calloc((size_t)dream->ncr+1,
+        sizeof(double));
+    dream->delta = (double *)calloc((size_t)dream->ncr+1, sizeof(double));
+    dream->delta_sum = (double *)calloc((size_t)dream->ncr+1, sizeof(double));
+    dream->delta_total = (double *)calloc((size_t)dream->ncr+1,
+        sizeof(double));
+    dream->counts = (int *)calloc((size_t)dream->ncr+1, sizeof(int));
+    dream->counts_sum = (int *)calloc((size_t)dream->ncr+1, sizeof(int));
+    dream->counts_total = (int *)calloc((size_t)dream->ncr+1, sizeof(int));
+
+    if(!dream->crossover || !dream->probabilities || !dream->delta 
+        || !dream->delta_sum || !dream->delta_total || !dream->counts 
+        || !dream->counts_sum || !dream->counts_total){
+      Free_Dream(dream);
+      return -1;
+    }
 
     int i;
 
-    for(i=1; i<=Cr->Num_Cr; i++){
-      Cr->Cr[i] = ((double)(i))/Cr->Num_Cr;
-      Cr->Delta[i] = 0;
-      Cr->Delta_tot[i] = 1;
-      Cr->Prob[i] = 1.0/Cr->Num_Cr;
-      Cr->counts[i] = 0;
+    for(i=1; i<=dream->ncr; i++){
+      dream->crossover[i] = ((double)(i))/dream->ncr;
+      dream->delta[i] = 0;
+      dream->delta_total[i] = 1;
+      dream->probabilities[i] = 1.0/dream->ncr;
+      dream->counts[i] = 0;
+      dream->counts_total[i] = 1;
+    }
+
+
+    dream->jump_dims = (int *)malloc(
+        sizeof(int)*(size_t)dream->nparams);
+    dream->diff = (double *)malloc(
+        sizeof(double)*(size_t)dream->nparams);
+    dream->scale_noise = (double *)malloc(
+        sizeof(double)*(size_t)dream->nparams);
+    dream->additive_noise = (double *)malloc(
+        sizeof(double)*(size_t)dream->nparams);
+
+    if(!dream->jump_dims || !dream->diff || !dream->scale_noise 
+        || !dream->additive_noise){
+      Free_Dream(dream);
+      return -1;
     }
     
     return 0 ;  
@@ -642,151 +1168,336 @@ extern int Init_Cr(STRUCT_CR *Cr){
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Sample_Cr(STRUCT_CR *Cr, STRUCT_MPI *Mpi){
+int Free_Dream(STRUCT_DREAM *dream){
+    if(!dream) return -1;
+    /*######################################################################
+      Purpose:
+        Release all dynamically allocated storage owned by DREAM.
+      Input parameters:
+        dream, DREAM state whose allocated members will be released.
+      Output parameters:
+        dream, with owned buffers released and allocation descriptors cleared.
+      Return:
+        0 on success.
+     ######################################################################*/
+
+
+    free(dream->crossover);
+    free(dream->probabilities);
+    free(dream->delta);
+    free(dream->delta_sum);
+    free(dream->delta_total);
+    free(dream->counts);
+    free(dream->counts_sum);
+    free(dream->counts_total);
+    free(dream->jump_dims);
+    free(dream->diff);
+    free(dream->scale_noise);
+    free(dream->additive_noise);
+
+    dream->crossover = NULL;
+    dream->probabilities = NULL;
+    dream->delta = NULL;
+    dream->delta_sum = NULL;
+    dream->delta_total = NULL;
+    dream->counts = NULL;
+    dream->counts_sum = NULL;
+    dream->counts_total = NULL;
+    dream->jump_dims = NULL;
+    dream->diff = NULL;
+    dream->scale_noise = NULL;
+    dream->additive_noise = NULL;
+   
+    return 0;
+}
+
+/*--------------------------------------------------------------------------------*/
+
+static int Sample_Cr(STRUCT_DREAM *dream, STRUCT_MPI *mpi){
     
     /*######################################################################
       Purpose:
-        Sample a CR index from the total number of Cr values according to 
-          the probability of each individual CR values.
-      Record of revisions:
-        30 Otc. 2022
+        Sample a crossover index from the current categorical distribution.
       Input parameters:
-        Cr, a structure saved the Cr information.
-        Mpi, a structure saved the Mpi information.
-      Output parameters:
-        .
+        dream, crossover probabilities.
+        mpi, random-number-generator state for the current rank.
       Return:
-        the CR index
+        Selected crossover index in the range 1 through ncr.
      ######################################################################*/
     
     int i;
-    double tmp = Ran1(Mpi->idum+Mpi->Rank);
+    double tmp = RNG_UNIFORM(mpi->rank_rng);
     
-    for(i=1; i<=Cr->Num_Cr; i++){
-      tmp -= Cr->Prob[i];
+    for(i=1; i<=dream->ncr; i++){
+      tmp -= dream->probabilities[i];
       if(tmp<0) return i;
     }
     
-    return Cr->Num_Cr; 
+    return dream->ncr; 
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Sample_PairNum(int MaxNum_Pair, STRUCT_MPI *Mpi){
+static int Sample_PairNum(int max_pairs, STRUCT_MPI *mpi){
     
     /*######################################################################
       Purpose:
-        Sample the number of chain pairs used to generate the jump.
-      Record of revisions:
-        30 Otc. 2022
+        Sample the number of chain pairs used to generate a jump.
       Input parameters:
-        MaxNum_Pair, the max number of chain pairs used to generate the jump.
-        Mpi, a structure saved the Mpi information.
-      Output parameters:
-        .
+        max_pairs, maximum permitted number of chain pairs.
+        mpi, random-number-generator state for the current rank.
       Return:
-        the number of chain pairs used to generate the jump.
+        Number of chain pairs, uniformly sampled from 1 through max_pairs.
      ######################################################################*/
     
-    int i, Num_Pair=1;
-    double tmp = Ran1(Mpi->idum+Mpi->Rank);
+    int i, npairs=1;
+    double tmp = RNG_UNIFORM(mpi->rank_rng);
     
-    for(i=1; i<=MaxNum_Pair; i++){
-      if(tmp<1.0/MaxNum_Pair){
-        Num_Pair=i;
+    for(i=1; i<=max_pairs; i++){
+      if(tmp<1.0/max_pairs){
+        npairs=i;
         break;
       }else{
-        tmp-=1.0/MaxNum_Pair;
+        tmp-=1.0/max_pairs;
       }
     }
     
-    return Num_Pair; 
+    return npairs; 
 }
 
 /*--------------------------------------------------------------------------------*/
 
-extern int Rm_Outlierchain(STRUCT_MPI *Mpi, STRUCT_DREAM *Dream, int Num_Par, \
-    int Gener){
+static int Rm_Outlierchain(STRUCT_MPI *mpi, STRUCT_DREAM *dream, int generation){
 
     /*######################################################################
       Purpose:
         Remove the outlier chains.
-      Record of revisions:
-        30 Otc. 2022
       Input parameters:
-        Mpi, a structure saved the Mpi information.
-        Dream, a structure saved the samples and likelihood.
-        Num_Par, the number of the model parameters.
-        Gener, the current generation.
+        mpi, MPI island layout and local chain range.
+        dream, circular sample and likelihood history.
+        nparams, number of model parameters.
+        generation, current generation index.
       Output parameters:
-        Dream, a structure saved the samples and likelihood.
+        dream, with detected outliers replaced by the best chain.
       Return:
         the number of outlier chains.
-      Reference:
-        Vrugt, J. A., et al. 2009. International Journal of Nonlinear 
+      Note:
+        Vrugt, j. A., et al. 2009. International Journal of Nonlinear 
           Science & Numerical Simulation, 10(3), 273-290
      ######################################################################*/
     
-    int Begin = Gener/2;
-    int Length = Gener-Begin+1;
-    double AVG_likelihood[Mpi->tot_dream];
-    int indx[Mpi->tot_dream];
+    if(!mpi || !dream || generation < 1 || dream->history_size < 2
+        || dream->nparams < 1 || mpi->total_chains < 4
+        || mpi->island_size < 1 || mpi->island_rank < 0
+        || mpi->island_rank >= mpi->island_size || mpi->chain_begin < 0
+        || mpi->chain_end < mpi->chain_begin
+        || mpi->chain_end >= mpi->total_chains
+        || !dream->chains.data_ptr || !dream->likelihood.data_ptr) return -1;
 
-    int Indx_Chain, Indx_Gener, Indx_Par, Indx_Rank;
+    double ***chains = TENSOR_DBL(dream->chains);
+    double **likelihood = MAT_DBL(dream->likelihood);
+    if(!chains || !likelihood) return -1;
+    int nparams = dream->nparams;
 
-    for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; Indx_Chain++){
-	    AVG_likelihood[Indx_Chain] = 0;
-      for(Indx_Gener=Begin; Indx_Gener<=Gener; Indx_Gener++){
-        AVG_likelihood[Indx_Chain] += Dream->Likelihood[Indx_Gener][Indx_Chain];
+    int Begin = generation/2;
+    if(generation-Begin+1 > dream->history_size){
+      Begin = generation+1-dream->history_size;
+    }
+    int window_length = generation-Begin+1;
+    double *mean_likelihood = calloc((size_t)mpi->total_chains,
+        sizeof(*mean_likelihood));
+    int *indices = malloc((size_t)mpi->total_chains*sizeof(*indices));
+    int allocation_status = mean_likelihood && indices ? 0 : -1;
+    if(mpi->island_size > 1){
+      if(MPI_Allreduce(MPI_IN_PLACE, &allocation_status, 1, MPI_INT, MPI_MIN,
+          mpi->island_comm) != MPI_SUCCESS) allocation_status = -1;
+    }
+    if(allocation_status != 0){
+      free(mean_likelihood);
+      free(indices);
+      return -1;
+    }
+    if(!mean_likelihood || !indices){
+      free(mean_likelihood);
+      free(indices);
+      return -1;
+    }
+
+    int chain_idx, generation_idx, param_idx;
+
+    for(chain_idx=mpi->chain_begin; chain_idx<=mpi->chain_end; chain_idx++){
+	    mean_likelihood[chain_idx] = 0;
+      for(generation_idx=Begin; generation_idx<=generation; generation_idx++){
+        mean_likelihood[chain_idx] += 
+            likelihood[generation_idx%dream->history_size][chain_idx];
       }
-      AVG_likelihood[Indx_Chain] /= Length;
+      mean_likelihood[chain_idx] /= window_length;
     }
 
-    for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-      MPI_Bcast(AVG_likelihood+Indx_Rank*Mpi->num_dream, Mpi->num_dream, \
-        MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
+    if(mpi->island_size > 1){
+      if(DREAM_Allgather_Likelihood(mean_likelihood, mpi) != 0){
+        free(mean_likelihood);
+        free(indices);
+        return -1;
+      }
     }
 
-    if(Mpi->Rank == 0) qsort_index(0, Mpi->tot_dream-1, AVG_likelihood, indx);
-    MPI_Bcast(indx, Mpi->tot_dream, MPI_INT, 0, MPI_COMM_WORLD);
+    for(chain_idx=0; chain_idx<mpi->total_chains; chain_idx++){
+      indices[chain_idx] = chain_idx;
+    }
+    int sort_status = 0;
+    if(mpi->island_rank == 0){
+      sort_status = SORT_INDICES(mean_likelihood, 
+          (size_t)mpi->total_chains, indices);
+    }
+    if(mpi->island_size > 1){
+      if(MPI_Bcast(&sort_status, 1, MPI_INT, 0, mpi->island_comm)
+          != MPI_SUCCESS){
+        free(mean_likelihood);
+        free(indices);
+        return -1;
+      }
+    }
+    if(sort_status != 0){
+      free(mean_likelihood);
+      free(indices);
+      return -1;
+    }
+    if(mpi->island_size > 1){
+      if(MPI_Bcast(indices, mpi->total_chains, MPI_INT, 0, mpi->island_comm)
+          != MPI_SUCCESS){
+        free(mean_likelihood);
+        free(indices);
+        return -1;
+      }
+    }
     
-    double Qr = AVG_likelihood[indx[Mpi->tot_dream*3/4]] \
-        -AVG_likelihood[indx[Mpi->tot_dream/4]];
-    double Omega = AVG_likelihood[indx[Mpi->tot_dream/4]]-Qr*2;
+    double Qr = mean_likelihood[indices[mpi->total_chains*3/4]] 
+        -mean_likelihood[indices[mpi->total_chains/4]];
+    double Omega = mean_likelihood[indices[mpi->total_chains/4]]-Qr*2;
     
-    int Num_Outlierchain=0;
+    int noutliers=0;
 
 
-    for(Indx_Chain=Mpi->indxb_dream; Indx_Chain<=Mpi->indxe_dream; Indx_Chain++){
-      if(AVG_likelihood[Indx_Chain]<Omega){
-        Num_Outlierchain++;
+    for(chain_idx=mpi->chain_begin; chain_idx<=mpi->chain_end; chain_idx++){
+      if(mean_likelihood[chain_idx]<Omega){
+        noutliers++;
                
-        for(Indx_Par=0; Indx_Par<Num_Par; Indx_Par++){
-          Dream->Chains[Gener][Indx_Chain][Indx_Par] = \
-              Dream->Chains[Gener][indx[Mpi->tot_dream-1]][Indx_Par];
+        for(param_idx=0; param_idx<nparams; param_idx++){
+          int slot = generation%dream->history_size;
+          chains[slot][chain_idx][param_idx] = 
+              chains[slot][indices[mpi->total_chains-1]][param_idx];
         }
-            
-        for(Indx_Gener=0; Indx_Gener<=Gener; Indx_Gener++){
-          Dream->Likelihood[Indx_Gener][Indx_Chain] = \
-              Dream->Likelihood[Indx_Gener][indx[Mpi->tot_dream-1]];
-        }     
+        int slot = generation%dream->history_size;
+        likelihood[slot][chain_idx] =
+            likelihood[slot][indices[mpi->total_chains-1]];
       }        
     }
 
-    for(Indx_Rank=0; Indx_Rank<Mpi->Num_procs; Indx_Rank++){
-      MPI_Bcast(Dream->Chains[Gener][Indx_Rank*Mpi->num_dream], \
-          Num_Par*Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
-      for(Indx_Gener=0; Indx_Gener<=Gener; Indx_Gener++){
-        MPI_Bcast(Dream->Likelihood[Indx_Gener]+Indx_Rank*Mpi->num_dream, \
-            Mpi->num_dream, MPI_DOUBLE, Indx_Rank, MPI_COMM_WORLD);
+    if(mpi->island_size > 1){
+      int gener_slot = generation%dream->history_size;
+      if(DREAM_Allgather(chains[gener_slot], likelihood[gener_slot], mpi,
+          nparams) != 0){
+        free(mean_likelihood);
+        free(indices);
+        return -1;
+      }
+    }
+
+    int total_outliers = noutliers;
+    if(mpi->island_size > 1
+        && MPI_Allreduce(&noutliers, &total_outliers, 1, MPI_INT, MPI_SUM,
+        mpi->island_comm) != MPI_SUCCESS){
+      free(mean_likelihood);
+      free(indices);
+      return -1;
+    }
+
+    if(total_outliers > 0){
+      DREAM_VERBOSE(mpi, 3, "Generation %d: replaced %d outlier chains.", 
+          generation, total_outliers);
+    }
+ 
+    free(mean_likelihood);
+    free(indices);
+    return total_outliers;
+}
+
+/*--------------------------------------------------------------------------------*/
+
+static int Bounds_Enforce(double *sample, STRUCT_PARA *params){
+    
+    /*######################################################################
+      Purpose:
+        Map sampled parameters back into their configured bounds.
+      Input parameters:
+        sample, proposed model parameters.
+        params, parameter bounds and parameter count.
+      Output parameters:
+        sample, bounded model parameters.
+      Return:
+        0 on success.
+     ######################################################################*/
+    
+    /* Bounds, policies, and free-parameter indices are initialized and
+       validated by INIT_DREAM(); only proposal values vary here. */
+    if(!sample || !params) return -1;
+
+    int param_idx;
+
+    if(params->magnetic_mode == MAGNETIC_CARTESIAN){
+      const int bx_idx = params->bx_free_index;
+      const int by_idx = params->by_free_index;
+
+      /* Resolve the 180-degree transverse-field ambiguity continuously at
+         the By=0 boundary: (Bx, By) and (-Bx, -By) are equivalent. */
+      if(bx_idx >= 0 && by_idx >= 0
+          && fabs(params->bounds[by_idx][0]) <= 1e-12
+          && params->bounds[by_idx][1] > 0.0
+          && sample[by_idx] < 0.0){
+        sample[by_idx] = -sample[by_idx];
+        sample[bx_idx] = -sample[bx_idx];
+      }
+    }
+
+    for(param_idx=0; param_idx<params->npar; param_idx++){
+      const double lower = params->bounds[param_idx][0];
+      const double upper = params->bounds[param_idx][1];
+      const double width = upper-lower;
+
+      if(!isfinite(sample[param_idx])) return -1;
+
+      if(width == 0.0){
+        sample[param_idx] = lower;
+      }else if(sample[param_idx] < lower || sample[param_idx] > upper){
+        switch(params->type[param_idx]){
+          case enum_fold:{
+            double offset = fmod(sample[param_idx]-lower, width);
+            if(offset < 0.0) offset += width;
+            sample[param_idx] = lower+offset;
+            break;
+          }
+
+          case enum_reflect:{
+            const double period = 2.0*width;
+            double offset = fmod(sample[param_idx]-lower, period);
+            if(offset < 0.0) offset += period;
+            if(offset > width) offset = period-offset;
+            sample[param_idx] = lower+offset;
+            break;
+          }
+
+          case enum_set:
+            sample[param_idx] = sample[param_idx] < lower ? lower : upper;
+            break;
+
+          default:
+            return -1;
+        }
       }
     }
     
-    if(Mpi->Rank == 0 && Num_Outlierchain >0) \
-        fprintf(stderr,"Generation: %d, Outlier chains = %d \n", Gener, \
-            Num_Outlierchain);
- 
-    return Num_Outlierchain;    
+    return 0;   
 }
 
 /*--------------------------------------------------------------------------------*/

@@ -1,74 +1,63 @@
 
-#ifndef DREAM_h
-#define DREAM_h
+#pragma once
 
 /*--------------------------------------------------------------------------------*/
 
-#include <stdio.h>
 #include <stdbool.h>
-#include <math.h>
-#include <time.h>
-#include <stdbool.h>
-#include <mpi.h>
 
-#include "ALLOCATION.h"
-#include "RANDOM_NUMBER.h"
-#include "GEMC.h"
-#include "LIKELIHOOD.h"
-#include "MPI_CONTROL.h"
-#include "SORT.h"
-#include "MATH_TOOL.h"
+#include "allocation.h"
+#include "parallel_runtime.h"
+#include "me_solver.h"
+
+/*--------------------------------------------------------------------------------*/
+
+#define DREAM_HISTORY_MAX 1501
+
+/*--------------------------------------------------------------------------------*/
+
+typedef enum Sample_Output_Mode{
+    SAMPLE_OUTPUT_NONE,
+    SAMPLE_OUTPUT_MAGNETIC,
+    SAMPLE_OUTPUT_ALL
+}SAMPLE_OUTPUT_MODE;
 
 /*--------------------------------------------------------------------------------*/
 
 typedef struct Struct_Dream{
-  double ***Chains;
-  double **Likelihood;
+
+    STRUCT_TENSOR chains;
+    STRUCT_MATRIX likelihood;
+    
+    int nchains, nparams, burnin_generations, sampling_generations;
+    int max_pairs, ncr, history_size;
+    int retained_generations;
+    double max_memory_gb, max_sample_file_gb;
+    bool update_crossover, update_proposal_noise;
+    SAMPLE_OUTPUT_MODE sample_output;
+
+    int *jump_dims;
+    double *diff, *scale_noise, *additive_noise;
+
+    //CR
+    double *crossover, *probabilities, *delta, *delta_total, *delta_sum;
+    int *counts, *counts_total, *counts_sum;
+
 }STRUCT_DREAM;
 
-typedef struct Struct_Cr{
-  int Num_Cr;
-  double *Cr, *Prob, *Delta, *Delta_tot, *Delta_sum;
-  int *counts, *counts_tot, *counts_sum;
-}STRUCT_CR;
+/*--------------------------------------------------------------------------------*/
+
+struct Struct_Profile_IO;
+struct Struct_Subset;
 
 /*--------------------------------------------------------------------------------*/
 
-extern int DREAM(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, STRUCT_DREAM *Dream, \
-    STRUCT_ATOM *Atom, STRUCT_OBSERVATION *Observation, STRUCT_PAR *Str_Par);
+extern int DREAM(STRUCT_MPI *mpi, STRUCT_DREAM *dream, STRUCT_PARA *params, 
+    STRUCT_STK *stokes, struct Struct_Profile_IO *input,
+    const struct Struct_Subset *subset);
 
-extern int Chain_Init_Dream(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, \
-    STRUCT_DREAM *Dream, STRUCT_ATOM *Atom, STRUCT_OBSERVATION *Observation, \
-    STRUCT_PAR *Str_Par);
+extern int INIT_DREAM(STRUCT_MPI *mpi, STRUCT_DREAM *dream, 
+    STRUCT_PARA *params, STRUCT_STK *stokes);
 
-extern int GEMC2DREAM(STRUCT_INPUT *Input, STRUCT_MPI *Mpi, STRUCT_GEMC *Gemc, \
-    STRUCT_DREAM *Dream, STRUCT_PAR *Str_Par, STRUCT_OBSERVATION *Observation, \
-    STRUCT_ATOM *Atom);
-
-extern int Dream_Sample(STRUCT_MPI *Mpi, STRUCT_CR *Cr, STRUCT_PAR *Str_Par, \
-    int Num_Pair, double **Chains, int Indx_Chain, int indx_Gener, \
-    double *Sample);
-
-extern int Sample_PairNum(int MaxNum_Pair, STRUCT_MPI *Mpi);
-
-extern int Init_Cr(STRUCT_CR *Cr);
-
-extern int Cr_Prob(STRUCT_CR *Cr, STRUCT_MPI *Mpi);
-
-extern int Cr_distance(double ***Chains, int Num_Chain, int Num_Par, \
-    int Indx_Chain, int Indx_Gener, int Indx_Cr, STRUCT_CR *Cr);
-
-extern int Sample_Cr(STRUCT_CR *Cr, STRUCT_MPI *Mpi);
-
-extern int Dream_Dim(STRUCT_MPI *Mpi, STRUCT_CR *Cr, STRUCT_PAR *Str_Par, \
-    int Indx_Cr, int *Jump_dim);
-
-extern int Dream_Diff(STRUCT_MPI *Mpi, double **Chains, int Indx_Chain, \
-    int Num_Pair, int Num_Jump, int *Jump_dim, double *Diff);
-
-extern int Rm_Outlierchain(STRUCT_MPI *Mpi, STRUCT_DREAM *Dream, int Num_Par, \
-    int Gener);
+extern int Free_Dream(STRUCT_DREAM *dream);
 
 /*--------------------------------------------------------------------------------*/
-
-#endif /* DREAM_h */

@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+#*--------------------------------------------------------------------------------*#
+# Default values
+#*--------------------------------------------------------------------------------*#
+
+prefix="."
+ccompiler="mpicc"
+cflags="-O3"
+lflags=""
+iflags=""
+enable_debug=no
+enable_gsl=no
+
+#*--------------------------------------------------------------------------------*#
+# OS detection
+#*--------------------------------------------------------------------------------*#
+
+OS="$(uname -s)"
+
+echo "Detected OS: $OS"
+
+#*--------------------------------------------------------------------------------*#
+# Argument parsing
+#*--------------------------------------------------------------------------------*#
+
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*) prefix="${arg#*=}" ;;
+        --ccompiler=*) ccompiler="${arg#*=}" ;;
+        --enable-gsl) enable_gsl=yes ;;
+        --disable-gsl) enable_gsl=no ;;
+        --debug) 
+	    enable_debug=yes
+	    cflags="-g -O1 -Wall -Wshadow -Wextra -Warray-bounds \
+		-pedantic -DDEBUG" ;;
+        --hard) cflags="-O2" ;;
+        --help)
+            echo "Usage: ./configure [options]"
+            echo "options:"
+            echo "  --prefix=<path>         installation prefix [default = .]"
+            echo "  --ccompiler=[cc]        C compiler used [default = mpicc]"
+            echo "  --enable-gsl            enable GSL random-number routines"
+            echo "  --disable-gsl           disable GSL [default]"
+            echo "  @ Predefined families of compilation flags:"
+            echo "  --O2                    O2 optimization:"
+            echo "                          -O2"
+            echo "  --debug                 use safe optimization:"
+            echo "                          -g -O1 -Wall -Wshadow -Wextra 
+		-Warray-bounds -pedantic -DDEBUG"
+            echo ""
+            exit 0;;
+        *)
+            echo "Unknown option: $arg"
+            exit 1 ;;
+    esac
+done
+
+
+#*--------------------------------------------------------------------------------*#
+# add flag function
+#*--------------------------------------------------------------------------------*#
+
+add_flag_once() {
+    case " $1 " in
+        *" $2 "* ) echo "$1" ;;   
+        * ) echo "$1 $2" ;;      
+    esac
+}
+
+#*--------------------------------------------------------------------------------*#
+# Compiler selection
+#*--------------------------------------------------------------------------------*#
+
+if ! command -v "$ccompiler" >/dev/null 2>&1; then
+    echo "ERROR: MPI compiler not found: $ccompiler"
+    exit 1
+fi
+
+echo "Using compiler: $ccompiler"
+
+
+#*--------------------------------------------------------------------------------*#
+# CFITSIO detection
+#*--------------------------------------------------------------------------------*#
+
+echo "Checking CFITSIO..."
+
+if mktemp --help 2>&1 | grep -q -- '--suffix'; then
+    tmpfile=$(mktemp --suffix=.c)
+else
+    tmp=$(mktemp /tmp/tmpfile.XXXXXX)
+    tmpfile="${tmp}.c"
+fi
+
+cat << EOF > "$tmpfile"
+#include <fitsio.h>
+int main(){ return 0; }
+EOF
+
+if "$ccompiler" "$tmpfile" -lcfitsio -o /dev/null >/dev/null 2>&1; then
+    echo "CFITSIO found via -lcfitsio"
+    lflags=$(add_flag_once "$lflags" "-lcfitsio")
+
+elif [ "$OS" = "Darwin" ] && brew --prefix cfitsio >/dev/null 2>&1; then
+    CFITSIO_PREFIX=$(brew --prefix cfitsio)
+    echo "Using Homebrew CFITSIO"
+    iflags=$(add_flag_once "$iflags" "-I$CFITSIO_PREFIX/include")
+    lflags=$(add_flag_once "$lflags" "-L$CFITSIO_PREFIX/lib")
+    lflags=$(add_flag_once "$lflags" "-lcfitsio")
+
+elif [ "$OS" = "Linux" ] && pkg-config --exists cfitsio 2>/dev/null; then
+    echo "CFITSIO found via pkg-config"
+
+    for flag in $(pkg-config --cflags cfitsio); do
+        iflags=$(add_flag_once "$iflags" "$flag")
+    done
+
+    for flag in $(pkg-config --libs cfitsio); do
+        lflags=$(add_flag_once "$lflags" "$flag")
+    done
+
+else
+    echo "ERROR: CFITSIO not found."
+    rm -f "$tmpfile"
+    exit 1
+fi
+
+rm -f "$tmpfile"
+
+#*--------------------------------------------------------------------------------*#
+# GSL detection
+#*--------------------------------------------------------------------------------*#
+
+if [ "$enable_gsl" != "no" ]; then
+    echo "Checking GSL..."
+
+    if mktemp --help 2>&1 | grep -q -- '--suffix'; then
+        tmpfile=$(mktemp --suffix=.c)
+    else
+        tmp=$(mktemp /tmp/tmpfile.XXXXXX)
+        tmpfile="${tmp}.c"
+    fi
+
+    cat << EOF > "$tmpfile"
+#include <gsl/gsl_sf_dawson.h>
+int main() {
+    double x = gsl_sf_dawson(1.0);
+    return (x > 0);
+}
+EOF
+
+    if "$ccompiler" "$tmpfile" $iflags $lflags -lgsl -lgslcblas -o /dev/null >/dev/null 2>&1; then
+        echo "GSL supported via -lgsl -lgslcblas"
+        cflags=$(add_flag_once "$cflags" "-DUSE_GSL")
+        lflags=$(add_flag_once "$lflags" "-lgsl")
+        lflags=$(add_flag_once "$lflags" "-lgslcblas")
+
+    elif [ "$OS" = "Darwin" ] && brew --prefix gsl >/dev/null 2>&1; then
+        GSL_PREFIX=$(brew --prefix gsl)
+        echo "Using Homebrew GSL"
+
+        cflags=$(add_flag_once "$cflags" "-DUSE_GSL")
+
+        iflags=$(add_flag_once "$iflags" "-I$GSL_PREFIX/include")
+        lflags=$(add_flag_once "$lflags" "-L$GSL_PREFIX/lib")
+        lflags=$(add_flag_once "$lflags" "-lgsl")
+        lflags=$(add_flag_once "$lflags" "-lgslcblas")
+
+    elif [ "$OS" = "Linux" ] && pkg-config --exists gsl 2>/dev/null; then
+        echo "GSL found via pkg-config"
+
+        for flag in $(pkg-config --cflags gsl); do
+            iflags=$(add_flag_once "$iflags" "$flag")
+        done
+
+        for flag in $(pkg-config --libs gsl); do
+            lflags=$(add_flag_once "$lflags" "$flag")
+        done
+
+        cflags=$(add_flag_once "$cflags" "-DUSE_GSL")
+
+    else
+        enable_gsl=no
+        echo "GSL not supported."
+    fi
+
+    rm -f "$tmpfile"
+fi
+
+
+#*--------------------------------------------------------------------------------*#
+# Ensure prefix trailing slash
+#*--------------------------------------------------------------------------------*#
+
+case "$prefix" in
+    */) ;;
+    *) prefix="$prefix/";;
+esac
+
+#*--------------------------------------------------------------------------------*#
+# Generate Makefile
+#*--------------------------------------------------------------------------------*#
+
+echo "Generating Makefile..."
+
+tmpfile=$(mktemp)
+
+{
+    echo "PREFIX = $prefix"
+    echo "CMP = $ccompiler"
+    echo "CFLAGS = -c $cflags "
+    echo "LFLAGS = $lflags"
+    echo "IFLAGS = $iflags"
+    cat src/makefile.in
+} > "$tmpfile"
+
+mv "$tmpfile" Makefile
+
+echo ""
+echo "Configuration summary:"
+echo "  OS:        $OS"
+echo "  Compiler:  $ccompiler"
+echo "  MPI:       required"
+echo "  CFITSIO:   detected"
+echo ""
+if [ "$enable_gsl" != "no" ]; then
+    echo "  GSL:       yes"
+else
+    echo "  GSL:       disable"
+fi
+echo ""
+echo "Run 'make' to build."
